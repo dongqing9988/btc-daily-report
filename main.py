@@ -970,10 +970,10 @@ def format_message(price, mvrv, nupl, etf, fg, funding, macro, weekly, deriv, fe
         if fr is not None:
             if fr > 0.03:
                 sentiment = '🟡多头偏强'
-                detail = f'资金费率{fr:+.4f}%>0.03%，多头付费持仓'
+                detail = f'资金费率{fr:+.4f}% &gt; 0.03%，多头付费持仓'
             elif fr < -0.03:
                 sentiment = '🟢空头偏强'
-                detail = f'资金费率{fr:+.4f}%<-0.03%，空头付费持仓'
+                detail = f'资金费率{fr:+.4f}% &lt; -0.03%，空头付费持仓'
             else:
                 sentiment = '⚪多空均衡'
                 detail = f'资金费率{fr:+.4f}%，多空力量均衡'
