@@ -192,9 +192,9 @@ def calculate_nupl(mvrv_data) -> Optional[float]:
 
 def fetch_etf_flows() -> Dict[str, Any]:
     result = {'daily_flow_m': None, 'consecutive_days': 0, 'cumulative_m': None,
-              'latest_date': None, 'recent_flows': []}
+              'latest_date': None, 'recent_flows': [], 'source': None, 'error': None}
 
-    def parse_table(html):
+    def parse_farside_table(html):
         soup = BeautifulSoup(html, 'lxml')
         tables = soup.find_all('table')
         if not tables:
@@ -213,35 +213,65 @@ def fetch_etf_flows() -> Dict[str, Any]:
                     daily_data.append((date_str, total))
         return daily_data
 
-    # 用session保持cookies，先访问首页
-    session = requests.Session()
-    session.headers.update(HEADERS)
+    def fetch_tftc():
+        """从TFTC.io获取ETF flow作为备选"""
+        try:
+            r = requests.get('https://www.tftc.io/bitcoin-etf-flows', headers=HEADERS, timeout=TIMEOUT)
+            if r.status_code != 200:
+                return None
+            import re
+            text = BeautifulSoup(r.text, 'lxml').get_text()
+            # 找最近的日期和flow，格式如 "Monday, Aug 18, 2026 · +$226.9M"
+            pattern = r'([A-Za-z]+,\s*[A-Za-z]+\s*\d+,\s*\d{4})\s*[·•]\s*([+-]?\$[\d,.]+[MB])'
+            matches = re.findall(pattern, text)
+            if not matches:
+                # 尝试另一种格式
+                pattern2 = r'([A-Z][a-z]+,\s*\d{1,2}\s*[A-Z][a-z]+,\s*\d{4})\s*([+-]?\$[\d,.]+[MB])'
+                matches = re.findall(pattern2, text)
+            if matches:
+                # 解析最新的flow
+                latest_date, flow_str = matches[0]
+                flow_val = safe_float(flow_str.replace('$', '').replace('M', '').replace('B', ''))
+                if flow_val is not None and 'B' in flow_str:
+                    flow_val *= 1000  # 转百万
+                # 计算连续流入天数（从matches中往前数）
+                consecutive = 0
+                for _, fs in matches:
+                    fv = safe_float(fs.replace('$', '').replace('M', '').replace('B', ''))
+                    if fv is not None and fv > 0:
+                        consecutive += 1
+                    else:
+                        break
+                return {'daily_flow_m': flow_val, 'latest_date': latest_date,
+                        'consecutive_days': consecutive, 'source': 'TFTC'}
+        except Exception as e:
+            logger.warning(f"TFTC ETF获取失败: {e}")
+        return None
 
+    # 用session保持cookies
+    session = requests.Session()
+    session.headers.update({
+        **HEADERS,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': 'https://farside.co.uk/',
+    })
+
+    # 方案1: farside /btc/ 页面（小页面，加载快）
     for attempt in range(3):
         try:
             # 先访问首页获取cookies
             session.get('https://farside.co.uk/', timeout=TIMEOUT)
-            time.sleep(1)
-
-            # 访问完整数据页（历史数据多，可算累计）
-            r = session.get('https://farside.co.uk/bitcoin-etf-flow-all-data/', timeout=TIMEOUT)
-            if r.status_code != 200:
-                logger.warning(f"farside完整页状态码: {r.status_code} (尝试{attempt+1})")
-                # 降级用/btc/页
-                r = session.get('https://farside.co.uk/btc/', timeout=TIMEOUT)
-
+            time.sleep(0.5)
+            r = session.get('https://farside.co.uk/btc/', timeout=TIMEOUT)
             if r.status_code == 200:
-                daily_data = parse_table(r.text)
+                daily_data = parse_farside_table(r.text)
                 if daily_data:
-                    # 最新一天
                     latest_date, latest_flow = daily_data[-1]
                     result['daily_flow_m'] = latest_flow
                     result['latest_date'] = latest_date
                     result['recent_flows'] = daily_data[-10:]
-
-                    # 累计净流入（全部历史累加）
-                    result['cumulative_m'] = sum(f for _, f in daily_data)
-
+                    result['source'] = 'farside'
                     # 连续流入天数
                     consecutive = 0
                     for _, flow in reversed(daily_data[-10:]):
@@ -250,16 +280,34 @@ def fetch_etf_flows() -> Dict[str, Any]:
                         else:
                             break
                     result['consecutive_days'] = consecutive
-
-                    logger.info(f"ETF: {latest_date} ${latest_flow:+.1f}M, 连续{consecutive}天, 累计${result['cumulative_m']:,.0f}M")
+                    # 尝试获取累计（用完整数据页）
+                    try:
+                        r2 = session.get('https://farside.co.uk/bitcoin-etf-flow-all-data/', timeout=TIMEOUT)
+                        if r2.status_code == 200:
+                            full_data = parse_farside_table(r2.text)
+                            if full_data:
+                                result['cumulative_m'] = sum(f for _, f in full_data)
+                    except:
+                        pass
+                    logger.info(f"ETF(farside): {latest_date} ${latest_flow:+.1f}M, 连续{consecutive}天, 累计${result.get('cumulative_m',0):,.0f}M")
                     return result
                 else:
-                    logger.warning(f"未解析到ETF数据 (尝试{attempt+1})")
+                    logger.warning(f"farside未解析到数据 (尝试{attempt+1}/3)")
         except Exception as e:
-            logger.warning(f"ETF获取失败 (尝试{attempt+1}/3): {e}")
+            logger.warning(f"farside ETF失败 (尝试{attempt+1}/3): {e}")
         if attempt < 2:
-            time.sleep(3)
+            time.sleep(2)
 
+    # 方案2: TFTC.io备选
+    logger.info("尝试TFTC.io备选...")
+    tftc_result = fetch_tftc()
+    if tftc_result:
+        result.update(tftc_result)
+        logger.info(f"ETF(TFTC): {result['latest_date']} ${result['daily_flow_m']:+.1f}M, 连续{result['consecutive_days']}天")
+        return result
+
+    result['error'] = "所有数据源均失败"
+    logger.error("ETF所有数据源均失败")
     return result
 
 
@@ -289,6 +337,22 @@ def fetch_funding_rate() -> Dict[str, Any]:
             return result
     except Exception as e:
         logger.warning(f"OKX资金费率失败: {e}")
+
+    # Bybit
+    try:
+        r = requests.get('https://api.bybit.com/v5/market/funding/history',
+                         params={'category': 'linear', 'symbol': 'BTCUSDT', 'limit': 1},
+                         headers=HEADERS, timeout=TIMEOUT)
+        if r.status_code == 200 and r.json().get('retCode') == 0:
+            data = r.json().get('result', {}).get('list', [])
+            if data:
+                result['funding_rate'] = float(data[0]['fundingRate']) * 100
+                result['source'] = 'Bybit'
+                logger.info(f"资金费率(Bybit): {result['funding_rate']:+.4f}%")
+                return result
+    except Exception as e:
+        logger.warning(f"Bybit资金费率失败: {e}")
+
     return result
 
 
@@ -331,26 +395,34 @@ def fetch_macro_fred() -> Dict[str, Any]:
 # ============ 8. Polymarket美联储利率概率 ============
 
 def fetch_fed_probability() -> Dict[str, Any]:
-    result = {'cut_prob': None, 'hike_prob': None, 'market_question': None}
+    result = {'cut_prob': None, 'hike_prob': None, 'market_question': None, 'error': None}
     try:
         # 搜索美联储相关市场
         r = requests.get('https://gamma-api.polymarket.com/markets',
-                         params={'search': 'fed rate', 'closed': 'false', 'limit': 15,
+                         params={'search': 'fed rate', 'closed': 'false', 'limit': 20,
                                  'order': 'volume24hr', 'ascending': 'false'},
                          headers=HEADERS, timeout=TIMEOUT)
         if r.status_code != 200:
+            result['error'] = f"HTTP {r.status_code}"
             logger.warning(f"Polymarket搜索状态码: {r.status_code}")
             return result
 
         markets = r.json()
+        if not isinstance(markets, list) or not markets:
+            result['error'] = "无搜索结果"
+            logger.warning("Polymarket无搜索结果")
+            return result
+
+        # 找最相关的市场
         best_market = None
         for m in markets:
-            q = m.get('question', '').lower()
+            q = str(m.get('question', '')).lower()
             if any(kw in q for kw in ['fed', 'fomc', 'rate', 'interest', 'cut', 'hike', 'powell']):
                 best_market = m
                 break
 
         if not best_market:
+            result['error'] = "未找到美联储相关市场"
             logger.warning("Polymarket未找到美联储相关市场")
             return result
 
@@ -358,20 +430,30 @@ def fetch_fed_probability() -> Dict[str, Any]:
         outcomes = best_market.get('outcomes', '[]')
         prices = best_market.get('outcomePrices', '[]')
         if isinstance(outcomes, str):
-            outcomes = json.loads(outcomes)
+            try:
+                outcomes = json.loads(outcomes)
+            except:
+                outcomes = []
         if isinstance(prices, str):
-            prices = json.loads(prices)
+            try:
+                prices = json.loads(prices)
+            except:
+                prices = []
 
         for o, p in zip(outcomes, prices):
-            prob = float(p) * 100
-            o_lower = o.lower()
-            if any(kw in o_lower for kw in ['cut', '降', '降息']):
+            try:
+                prob = float(p) * 100
+            except:
+                continue
+            o_lower = str(o).lower()
+            if any(kw in o_lower for kw in ['cut', '降', '降息', 'lower']):
                 result['cut_prob'] = prob
-            elif any(kw in o_lower for kw in ['hike', '加', '加息', 'raise']):
+            elif any(kw in o_lower for kw in ['hike', '加', '加息', 'raise', 'higher']):
                 result['hike_prob'] = prob
 
-        logger.info(f"Polymarket: {result['market_question'][:50]}... 降息={result['cut_prob']}%, 加息={result['hike_prob']}%")
+        logger.info(f"Polymarket: {str(result['market_question'])[:50]}... 降息={result['cut_prob']}%, 加息={result['hike_prob']}%")
     except Exception as e:
+        result['error'] = str(e)
         logger.warning(f"Polymarket失败: {e}")
     return result
 
@@ -379,7 +461,30 @@ def fetch_fed_probability() -> Dict[str, Any]:
 # ============ 9. BTC周线 + 200周均线 + 偏离率 ============
 
 def fetch_btc_weekly() -> Dict[str, Any]:
-    result = {'sma200w': None, 'current_price': None, 'deviation_200w': None}
+    result = {'sma200w': None, 'current_price': None, 'deviation_200w': None, 'source': None}
+
+    # 方案1: Coinbase（美国交易所，对美国IP友好）
+    try:
+        r = requests.get('https://api.exchange.coinbase.com/products/BTC-USD/candles',
+                         params={'granularity': 604800, 'limit': 210},  # 604800秒=1周
+                         headers={**HEADERS, 'Accept': 'application/json'}, timeout=TIMEOUT)
+        if r.status_code == 200:
+            klines = r.json()
+            # Coinbase返回 [time, low, high, open, close, volume]，按时间倒序
+            closes = [safe_float(k[4]) for k in klines]
+            closes = [c for c in closes if c is not None]
+            closes.reverse()  # 转为正序
+            if len(closes) >= 200:
+                result['sma200w'] = sum(closes[-200:]) / 200
+                result['current_price'] = closes[-1]
+                result['deviation_200w'] = (closes[-1] - result['sma200w']) / result['sma200w'] * 100
+                result['source'] = 'Coinbase'
+                logger.info(f"200周SMA(Coinbase): ${result['sma200w']:,.0f}, 当前: ${closes[-1]:,.0f}, 偏离: {result['deviation_200w']:+.1f}%")
+                return result
+    except Exception as e:
+        logger.warning(f"Coinbase周线失败: {e}")
+
+    # 方案2: Binance
     try:
         r = requests.get('https://api.binance.com/api/v3/klines',
                          params={'symbol': 'BTCUSDT', 'interval': '1w', 'limit': 210},
@@ -392,26 +497,49 @@ def fetch_btc_weekly() -> Dict[str, Any]:
                 result['sma200w'] = sum(closes[-200:]) / 200
                 result['current_price'] = closes[-1]
                 result['deviation_200w'] = (closes[-1] - result['sma200w']) / result['sma200w'] * 100
-                logger.info(f"200周SMA: ${result['sma200w']:,.0f}, 当前: ${closes[-1]:,.0f}, 偏离: {result['deviation_200w']:+.1f}%")
+                result['source'] = 'Binance'
+                logger.info(f"200周SMA(Binance): ${result['sma200w']:,.0f}, 当前: ${closes[-1]:,.0f}, 偏离: {result['deviation_200w']:+.1f}%")
+                return result
     except Exception as e:
-        logger.warning(f"BTC周线失败: {e}")
+        logger.warning(f"Binance周线失败: {e}")
+
     return result
 
 
 # ============ 10. 未平仓合约量OI + 多空比 ============
 
 def fetch_derivatives() -> Dict[str, Any]:
-    result = {'open_interest': None, 'long_short_ratio': None, 'long_account': None, 'short_account': None}
-    # OI
+    result = {'open_interest': None, 'long_short_ratio': None, 'long_account': None, 'short_account': None, 'oi_source': None, 'ls_source': None}
+
+    # ===== OI =====
+    # Binance
     try:
         r = requests.get('https://fapi.binance.com/fapi/v1/openInterest',
                          params={'symbol': 'BTCUSDT'}, headers=HEADERS, timeout=TIMEOUT)
         if r.status_code == 200:
             result['open_interest'] = float(r.json()['openInterest'])
-            logger.info(f"OI: {result['open_interest']:,.0f} BTC")
+            result['oi_source'] = 'Binance'
+            logger.info(f"OI(Binance): {result['open_interest']:,.0f} BTC")
     except Exception as e:
-        logger.warning(f"OI失败: {e}")
-    # 多空比
+        logger.warning(f"Binance OI失败: {e}")
+
+    # Bybit备选
+    if result['open_interest'] is None:
+        try:
+            r = requests.get('https://api.bybit.com/v5/market/open-interest',
+                             params={'category': 'linear', 'symbol': 'BTCUSDT'},
+                             headers=HEADERS, timeout=TIMEOUT)
+            if r.status_code == 200 and r.json().get('retCode') == 0:
+                data = r.json().get('result', {})
+                if data:
+                    result['open_interest'] = float(data.get('openInterest', 0))
+                    result['oi_source'] = 'Bybit'
+                    logger.info(f"OI(Bybit): {result['open_interest']:,.0f} BTC")
+        except Exception as e:
+            logger.warning(f"Bybit OI失败: {e}")
+
+    # ===== 多空比 =====
+    # Binance
     try:
         r = requests.get('https://fapi.binance.com/futures/data/globalLongShortAccountRatio',
                          params={'symbol': 'BTCUSDT', 'period': '1h', 'limit': 1},
@@ -422,9 +550,26 @@ def fetch_derivatives() -> Dict[str, Any]:
                 result['long_short_ratio'] = float(data[0]['longShortRatio'])
                 result['long_account'] = float(data[0]['longAccount'])
                 result['short_account'] = float(data[0]['shortAccount'])
-                logger.info(f"多空比: {result['long_short_ratio']:.2f}")
+                result['ls_source'] = 'Binance'
+                logger.info(f"多空比(Binance): {result['long_short_ratio']:.2f}")
     except Exception as e:
-        logger.warning(f"多空比失败: {e}")
+        logger.warning(f"Binance多空比失败: {e}")
+
+    # Bybit备选
+    if result['long_short_ratio'] is None:
+        try:
+            r = requests.get('https://api.bybit.com/v5/market/account-ratio',
+                             params={'category': 'linear', 'symbol': 'BTCUSDT', 'period': '5min'},
+                             headers=HEADERS, timeout=TIMEOUT)
+            if r.status_code == 200 and r.json().get('retCode') == 0:
+                data = r.json().get('result', {}).get('list', [])
+                if data:
+                    result['long_short_ratio'] = float(data[0].get('buyRatio', 0)) / float(data[0].get('sellRatio', 1))
+                    result['ls_source'] = 'Bybit'
+                    logger.info(f"多空比(Bybit): {result['long_short_ratio']:.2f}")
+        except Exception as e:
+            logger.warning(f"Bybit多空比失败: {e}")
+
     return result
 
 
@@ -536,6 +681,9 @@ def format_message(price, mvrv, nupl, etf, fg, funding, macro, weekly, deriv, fe
     else:
         L.append("💰 <b>价格</b>：获取失败")
 
+    if mvrv.get('realized_price'):
+        L.append(f"🏷️ <b>已实现价格</b>：${mvrv['realized_price']:,.0f}（链上平均持仓成本）")
+
     if fg.get('value') is not None:
         v = fg['value']
         emoji = '🟢' if v < 45 else ('🔴' if v > 55 else '⚪')
@@ -548,10 +696,7 @@ def format_message(price, mvrv, nupl, etf, fg, funding, macro, weekly, deriv, fe
     L.append("━━━ <b>二、链上估值</b> ━━━")
     if mvrv.get('mvrv') is not None:
         zone_emoji = {'deep_bottom':'🔴','low':'🟡','neutral':'⚪','high':'🟡','top':'🔴'}.get(mvrv.get('zone'),'⚪')
-        line = f"📈 <b>MVRV</b>：{mvrv['mvrv']:.2f} {zone_emoji} {mvrv.get('zone_label','')}"
-        if mvrv.get('realized_price'):
-            line += f"  |  已实现价格：${mvrv['realized_price']:,.0f}"
-        L.append(line)
+        L.append(f"📈 <b>MVRV</b>：{mvrv['mvrv']:.2f} {zone_emoji} {mvrv.get('zone_label','')}")
         L.append(f"   阈值：&lt;1.0底部 | 1.0-1.5偏低 | 1.5-2.5中性 | &gt;3.5顶部")
     else:
         L.append("📈 <b>MVRV</b>：获取失败")
