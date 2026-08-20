@@ -538,9 +538,11 @@ def fetch_fed_probability(macro: Dict[str, Any] = None) -> Dict[str, Any]:
                             if current_low is not None and current_high is not None:
                                 if abs(low - current_low) < 0.01 and abs(high - current_high) < 0.01:
                                     hold_prob += prob_val
-                                elif low > current_high + 0.01:
+                                elif low >= current_high - 0.01:
+                                    # 加息：新区间下限 >= 当前区间上限（加息25bp后新区间从当前上限开始）
                                     hike_prob += prob_val
-                                elif high < current_low - 0.01:
+                                elif high <= current_low + 0.01:
+                                    # 降息：新区间上限 <= 当前区间下限（降息25bp后新区间到当前下限结束）
                                     cut_prob += prob_val
                             else:
                                 # 无法确定当前区间，概率最高的作为维持
