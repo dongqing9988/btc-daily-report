@@ -1005,7 +1005,7 @@ def format_message(price, mvrv, nupl, etf, fg, funding, macro, weekly, deriv, fe
     L.append("• <b>ETF资金流</b>：现货ETF每日资金进出，代表机构动向")
     L.append("• <b>资金费率</b>：永续合约多空成本，正数多头付费")
     L.append("• <b>OI未平仓量</b>：合约市场总持仓，反映市场参与度")
-    L.append("• <b>多空情绪</b>：综合资金费率判断，费率>0.03%多头偏强，<-0.03%空头偏强")
+    L.append("• <b>多空情绪</b>：综合资金费率判断，费率&gt;0.03%多头偏强，&lt;-0.03%空头偏强")
     L.append("")
     L.append("<i>数据来源：bitbo.io/Alternative.me/farside.co.uk/FRED/CoinGecko/Kraken</i>")
 
