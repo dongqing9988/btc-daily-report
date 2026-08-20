@@ -372,17 +372,21 @@ def fetch_funding_rate() -> Dict[str, Any]:
 # ============ 7. FRED宏观数据 ============
 
 def fetch_macro_fred() -> Dict[str, Any]:
-    result = {'tips10y': None, 'treasury10y': None, 'vix': None, 'dxy': None, 'fed_funds': None}
+    result = {'tips10y': None, 'treasury10y': None, 'vix': None, 'dxy': None, 'fed_funds': None,
+              'cpi_yoy': None, 'unrate': None, 'inflation_exp': None}
     if not FRED_API_KEY:
         logger.warning("FRED_API_KEY未配置，跳过宏观数据")
         return result
 
+    # 普通系列：取最新值
     series_map = {
         'tips10y': 'DFII10',       # 10年期TIPS实际收益率
         'treasury10y': 'DGS10',    # 10年期美债名义收益率
         'vix': 'VIXCLS',            # VIX
         'dxy': 'DTWEXBGS',          # 贸易加权美元指数
         'fed_funds': 'FEDFUNDS',    # 联邦基金利率
+        'unrate': 'UNRATE',         # 失业率
+        'inflation_exp': 'T10YIE',  # 10年期breakeven通胀预期
     }
 
     for key, series_id in series_map.items():
@@ -401,7 +405,26 @@ def fetch_macro_fred() -> Dict[str, Any]:
         except Exception as e:
             logger.warning(f"FRED {key}({series_id})失败: {e}")
 
-    logger.info(f"宏观: TIPS={result['tips10y']}%, 10Y={result['treasury10y']}%, VIX={result['vix']}, DXY={result['dxy']}, FFR={result['fed_funds']}%")
+    # CPI同比：需要当前值和一年前的值
+    try:
+        r = requests.get('https://api.stlouisfed.org/fred/series/observations',
+                         params={'series_id': 'CPIAUCSL', 'api_key': FRED_API_KEY,
+                                 'file_type': 'json', 'limit': 15, 'sort_order': 'desc'},
+                         headers=HEADERS, timeout=TIMEOUT)
+        if r.status_code == 200:
+            obs = r.json().get('observations', [])
+            vals = [(o.get('date'), safe_float(o.get('value'))) for o in obs]
+            vals = [(d, v) for d, v in vals if v is not None]
+            if len(vals) >= 13:
+                current = vals[0][1]
+                year_ago = vals[-1][1]
+                if year_ago > 0:
+                    result['cpi_yoy'] = (current / year_ago - 1) * 100
+                    logger.info(f"CPI同比: {result['cpi_yoy']:.2f}% (当前={current}, 一年前={year_ago})")
+    except Exception as e:
+        logger.warning(f"FRED CPI同比失败: {e}")
+
+    logger.info(f"宏观: TIPS={result['tips10y']}%, 10Y={result['treasury10y']}%, VIX={result['vix']}, DXY={result['dxy']}, FFR={result['fed_funds']}%, CPI={result['cpi_yoy']}%, 失业={result['unrate']}%, 通胀预期={result['inflation_exp']}%")
     return result
 
 
@@ -448,91 +471,60 @@ def _kalshi_auth_headers(method: str, path: str) -> Dict[str, str]:
         logger.warning(f"Kalshi签名失败: {e}")
         return {}
 
-def fetch_fed_probability() -> Dict[str, Any]:
+def fetch_fed_probability(macro: Dict[str, Any] = None) -> Dict[str, Any]:
     result = {'cut_prob': None, 'hike_prob': None, 'hold_prob': None,
-              'market_question': None, 'error': None, 'source': 'Kalshi'}
-    try:
-        # Kalshi: 搜索KXFED系列的开放市场
-        base_url = 'https://api.elections.kalshi.com/trade-api/v2'
-        path = '/markets'
-        headers = {**HEADERS, 'Accept': 'application/json', **_kalshi_auth_headers('GET', path)}
-        r = requests.get(f'{base_url}{path}',
-                         params={'series_ticker': 'KXFED', 'status': 'open', 'limit': 20},
-                         headers=headers, timeout=TIMEOUT)
-        if r.status_code != 200:
-            result['error'] = f"HTTP {r.status_code}"
-            logger.warning(f"Kalshi搜索状态码: {r.status_code}, body: {r.text[:200]}")
-            return result
+              'theoretical_rate': None, 'current_rate': None, 'cpi_yoy': None,
+              'unrate': None, 'inflation_exp': None, 'error': None, 'source': 'FRED泰勒规则'}
 
-        markets = r.json().get('markets', [])
-        if not markets:
-            result['error'] = "无KXFED开放市场"
-            logger.warning("Kalshi无KXFED开放市场")
-            return result
+    if macro is None:
+        result['error'] = '无宏观数据'
+        return result
 
-        # 找最近到期的市场（按expiration_time排序）
-        markets.sort(key=lambda m: m.get('expiration_time', ''))
-        target_market = markets[0]
-        result['market_question'] = target_market.get('title') or target_market.get('ticker')
+    fed_funds = macro.get('fed_funds')
+    cpi_yoy = macro.get('cpi_yoy')
+    unrate = macro.get('unrate')
+    inflation_exp = macro.get('inflation_exp')
 
-        # 获取市场详情（获取更准确的价格）
-        ticker = target_market.get('ticker')
-        if ticker:
-            path2 = f'/markets/{ticker}'
-            headers2 = {**HEADERS, 'Accept': 'application/json', **_kalshi_auth_headers('GET', path2)}
-            r2 = requests.get(f'{base_url}{path2}', headers=headers2, timeout=TIMEOUT)
-            if r2.status_code == 200:
-                market_detail = r2.json().get('market', target_market)
-            else:
-                market_detail = target_market
-        else:
-            market_detail = target_market
+    if fed_funds is None or cpi_yoy is None or unrate is None:
+        result['error'] = 'FRED数据不全'
+        return result
 
-        # Kalshi价格以美分计，yes_bid/yes_ask的中间价就是概率
-        yes_bid = safe_float(market_detail.get('yes_bid'))
-        yes_ask = safe_float(market_detail.get('yes_ask'))
-        last_price = safe_float(market_detail.get('last_price'))
+    result['current_rate'] = fed_funds
+    result['cpi_yoy'] = cpi_yoy
+    result['unrate'] = unrate
+    result['inflation_exp'] = inflation_exp
 
-        prob = None
-        if yes_bid is not None and yes_ask is not None:
-            prob = (yes_bid + yes_ask) / 2 / 100 * 100  # 美分转百分比
-        elif last_price is not None:
-            prob = last_price / 100 * 100
+    # 泰勒规则：理论利率 = 通胀率 + 均衡实际利率(2%) + 0.5*(通胀率-目标2%) + 0.5*(自然失业率4%-当前失业率)
+    theoretical = cpi_yoy + 2 + 0.5 * (cpi_yoy - 2) + 0.5 * (4 - unrate)
+    result['theoretical_rate'] = round(theoretical, 2)
 
-        title_lower = str(result['market_question']).lower()
-        if prob is not None:
-            # 根据标题判断是加息/降息/维持
-            if any(kw in title_lower for kw in ['cut', '降', '降息', 'lower', 'decrease', 'reduce']):
-                result['cut_prob'] = prob
-            elif any(kw in title_lower for kw in ['hike', '加', '加息', 'raise', 'higher', 'increase']):
-                result['hike_prob'] = prob
-            elif any(kw in title_lower for kw in ['hold', '维持', '不变', 'unchanged', 'pause']):
-                result['hold_prob'] = prob
-            else:
-                # 如果标题不明确，把概率作为hold（最常见）
-                result['hold_prob'] = prob
+    # 差值 = 理论利率 - 当前利率（正数=加息压力，负数=降息压力）
+    diff = theoretical - fed_funds
 
-        # 如果只找到了一个市场，尝试搜索同一系列的其他市场获取加息/降息
-        if result['cut_prob'] is None or result['hike_prob'] is None:
-            for m in markets[1:5]:  # 看前5个市场
-                m_title = str(m.get('title', '')).lower()
-                m_ticker = str(m.get('ticker', ''))
-                m_yes_bid = safe_float(m.get('yes_bid'))
-                m_yes_ask = safe_float(m.get('yes_ask'))
-                m_prob = None
-                if m_yes_bid is not None and m_yes_ask is not None:
-                    m_prob = (m_yes_bid + m_yes_ask) / 2
-                if m_prob is None:
-                    continue
-                if result['cut_prob'] is None and any(kw in m_title for kw in ['cut', '降', '降息', 'lower']):
-                    result['cut_prob'] = m_prob
-                elif result['hike_prob'] is None and any(kw in m_title for kw in ['hike', '加', '加息', 'raise', 'higher']):
-                    result['hike_prob'] = m_prob
+    # 通胀预期调整
+    if inflation_exp is not None:
+        if inflation_exp > 2.5:
+            diff += 0.3  # 通胀预期高，加息压力增大
+        elif inflation_exp < 1.5:
+            diff -= 0.3  # 通胀预期低，降息压力增大
 
-        logger.info(f"Kalshi: {str(result['market_question'])[:60]}... 降息={result['cut_prob']}%, 加息={result['hike_prob']}%, 维持={result['hold_prob']}%")
-    except Exception as e:
-        result['error'] = str(e)
-        logger.warning(f"Kalshi失败: {e}")
+    # 计算概率
+    if diff > 0.1:
+        hike_prob = min(diff / 1.5 * 100, 80)
+        cut_prob = max(5, 100 - hike_prob - 20)
+    elif diff < -0.1:
+        cut_prob = min(abs(diff) / 1.5 * 100, 80)
+        hike_prob = max(5, 100 - cut_prob - 20)
+    else:
+        hike_prob = 15
+        cut_prob = 15
+
+    hold_prob = 100 - hike_prob - cut_prob
+    result['hike_prob'] = round(hike_prob, 1)
+    result['cut_prob'] = round(cut_prob, 1)
+    result['hold_prob'] = round(hold_prob, 1)
+
+    logger.info(f"FRED泰勒规则: 当前={fed_funds}%, 理论={theoretical:.2f}%, 差值={diff:+.2f}%, 加息={hike_prob:.1f}%, 降息={cut_prob:.1f}%, 维持={hold_prob:.1f}%")
     return result
 
 
@@ -913,17 +905,32 @@ def format_message(price, mvrv, nupl, etf, fg, funding, macro, weekly, deriv, fe
         L.append(f"😱 <b>VIX恐慌指数</b>：{macro['vix']:.1f}")
     if macro.get('fed_funds') is not None:
         L.append(f"🏦 <b>联邦基金利率</b>：{macro['fed_funds']:.2f}%")
-    if fed_prob.get('cut_prob') is not None or fed_prob.get('hike_prob') is not None:
+    if fed_prob.get('hike_prob') is not None or fed_prob.get('cut_prob') is not None:
         prob_parts = []
-        if fed_prob.get('cut_prob') is not None:
-            prob_parts.append(f"降息{fed_prob['cut_prob']:.0f}%")
         if fed_prob.get('hike_prob') is not None:
             prob_parts.append(f"加息{fed_prob['hike_prob']:.0f}%")
+        if fed_prob.get('cut_prob') is not None:
+            prob_parts.append(f"降息{fed_prob['cut_prob']:.0f}%")
+        if fed_prob.get('hold_prob') is not None:
+            prob_parts.append(f"维持{fed_prob['hold_prob']:.0f}%")
         if prob_parts:
-            L.append(f"🎯 <b>Polymarket利率预期</b>：{' | '.join(prob_parts)}")
+            L.append(f"🎯 <b>利率预期(泰勒规则)</b>：{' | '.join(prob_parts)}")
+            if fed_prob.get('theoretical_rate') is not None and fed_prob.get('current_rate') is not None:
+                diff = fed_prob['theoretical_rate'] - fed_prob['current_rate']
+                L.append(f"   当前{fed_prob['current_rate']}% → 理论{fed_prob['theoretical_rate']}%（差值{diff:+.2f}%）")
+            if fed_prob.get('cpi_yoy') is not None or fed_prob.get('unrate') is not None:
+                detail = []
+                if fed_prob.get('cpi_yoy') is not None:
+                    detail.append(f"CPI {fed_prob['cpi_yoy']:.1f}%")
+                if fed_prob.get('unrate') is not None:
+                    detail.append(f"失业{fed_prob['unrate']:.1f}%")
+                if fed_prob.get('inflation_exp') is not None:
+                    detail.append(f"通胀预期{fed_prob['inflation_exp']:.1f}%")
+                if detail:
+                    L.append(f"   {' | '.join(detail)}")
     else:
         err = fed_prob.get('error', '')
-        L.append(f"🎯 <b>Polymarket利率预期</b>：获取失败{('（'+err+'）') if err else ''}")
+        L.append(f"🎯 <b>利率预期</b>：获取失败{('（'+err+'）') if err else ''}")
     L.append("")
 
     # ===== 四、资金流 =====
@@ -958,7 +965,22 @@ def format_message(price, mvrv, nupl, etf, fg, funding, macro, weekly, deriv, fe
         ls_tag = '🟡多头拥挤' if ls > 1.5 else ('🟢空头拥挤' if ls < 0.7 else '⚪中性')
         L.append(f"👥 <b>散户多空比</b>：{ls:.2f}  {ls_tag}")
     else:
-        L.append("👥 <b>散户多空比</b>：获取失败")
+        # 多空比获取失败时，用资金费率综合判断多空情绪
+        fr = funding.get('funding_rate')
+        if fr is not None:
+            if fr > 0.03:
+                sentiment = '🟡多头偏强'
+                detail = f'资金费率{fr:+.4f}%>0.03%，多头付费持仓'
+            elif fr < -0.03:
+                sentiment = '🟢空头偏强'
+                detail = f'资金费率{fr:+.4f}%<-0.03%，空头付费持仓'
+            else:
+                sentiment = '⚪多空均衡'
+                detail = f'资金费率{fr:+.4f}%，多空力量均衡'
+            L.append(f"👥 <b>多空情绪(综合)</b>：{sentiment}")
+            L.append(f"   {detail}")
+        else:
+            L.append("👥 <b>多空情绪</b>：数据不足")
     L.append("")
 
     # ===== 信号预警 =====
@@ -979,12 +1001,13 @@ def format_message(price, mvrv, nupl, etf, fg, funding, macro, weekly, deriv, fe
     L.append("• <b>TIPS实际收益率</b>：扣除通胀后的真实利率，&gt;2%强紧缩")
     L.append("• <b>美元指数</b>：美元强弱，强美元周期BTC普遍承压")
     L.append("• <b>VIX</b>：美股波动率，&gt;30高恐慌，&lt;15极度平静")
+    L.append("• <b>利率预期</b>：泰勒规则计算，理论利率=CPI+2+0.5*(CPI-2)+0.5*(4-失业率)")
     L.append("• <b>ETF资金流</b>：现货ETF每日资金进出，代表机构动向")
     L.append("• <b>资金费率</b>：永续合约多空成本，正数多头付费")
     L.append("• <b>OI未平仓量</b>：合约市场总持仓，反映市场参与度")
-    L.append("• <b>多空比</b>：散户多空账户比，&gt;1.5多头拥挤易插针")
+    L.append("• <b>多空情绪</b>：综合资金费率判断，费率>0.03%多头偏强，<-0.03%空头偏强")
     L.append("")
-    L.append("<i>数据来源：Binance/bitbo.io/Alternative.me/farside.co.uk/FRED/Polymarket</i>")
+    L.append("<i>数据来源：bitbo.io/Alternative.me/farside.co.uk/FRED/CoinGecko/Kraken</i>")
 
     return '\n'.join(L)
 
@@ -1029,7 +1052,7 @@ def main():
     macro = fetch_macro_fred()
     weekly = fetch_btc_weekly()
     deriv = fetch_derivatives()
-    fed_prob = fetch_fed_probability()
+    fed_prob = fetch_fed_probability(macro)
 
     signals = check_signals(price, mvrv, nupl, etf, fg, funding, macro, weekly, deriv, fed_prob)
     message = format_message(price, mvrv, nupl, etf, fg, funding, macro, weekly, deriv, fed_prob, signals)
