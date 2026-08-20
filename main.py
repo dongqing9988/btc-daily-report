@@ -229,21 +229,29 @@ def fetch_etf_flows() -> Dict[str, Any]:
                 pattern2 = r'([A-Z][a-z]+,\s*\d{1,2}\s*[A-Z][a-z]+,\s*\d{4})\s*([+-]?\$[\d,.]+[MB])'
                 matches = re.findall(pattern2, text)
             if matches:
-                # 解析最新的flow
-                latest_date, flow_str = matches[0]
-                flow_val = safe_float(flow_str.replace('$', '').replace('M', '').replace('B', ''))
-                if flow_val is not None and 'B' in flow_str:
-                    flow_val *= 1000  # 转百万
-                # 计算连续流入天数（从matches中往前数）
-                consecutive = 0
+                # 解析所有flow
+                all_flows = []
                 for _, fs in matches:
                     fv = safe_float(fs.replace('$', '').replace('M', '').replace('B', ''))
-                    if fv is not None and fv > 0:
+                    if fv is not None:
+                        if 'B' in fs:
+                            fv *= 1000
+                        all_flows.append(fv)
+                # 最新的flow
+                latest_date, flow_str = matches[0]
+                flow_val = all_flows[0] if all_flows else None
+                # 连续流入天数
+                consecutive = 0
+                for fv in all_flows:
+                    if fv > 0:
                         consecutive += 1
                     else:
                         break
+                # 累计（从matches中累加）
+                cumulative = sum(all_flows) if all_flows else None
                 return {'daily_flow_m': flow_val, 'latest_date': latest_date,
-                        'consecutive_days': consecutive, 'source': 'TFTC'}
+                        'consecutive_days': consecutive, 'cumulative_m': cumulative,
+                        'cumulative_type': f'近{len(all_flows)}个交易日', 'source': 'TFTC'}
         except Exception as e:
             logger.warning(f"TFTC ETF获取失败: {e}")
         return None
@@ -666,7 +674,6 @@ def fetch_derivatives() -> Dict[str, Any]:
                              headers={**HEADERS, 'Accept': 'application/json'}, timeout=TIMEOUT)
             if r.status_code == 200:
                 data = r.json()
-                # Coinglass返回格式可能是 {"data": {"longShortRatioList": [...]}}
                 if isinstance(data, dict):
                     ls_list = data.get('data', {}).get('longShortRatioList', [])
                     if ls_list:
@@ -676,6 +683,39 @@ def fetch_derivatives() -> Dict[str, Any]:
                         logger.info(f"多空比(Coinglass): {result['long_short_ratio']:.2f}")
         except Exception as e:
             logger.warning(f"Coinglass多空比失败: {e}")
+
+    # OKX备选
+    if result['long_short_ratio'] is None:
+        try:
+            r = requests.get('https://www.okx.com/api/v5/public/long-short-ratio',
+                             params={'instId': 'BTC-USDT-SWTP', 'period': '1H'},
+                             headers=HEADERS, timeout=TIMEOUT)
+            if r.status_code == 200 and r.json().get('code') == '0':
+                data = r.json().get('data', [])
+                if data:
+                    result['long_short_ratio'] = float(data[0].get('longShortRatio', 1))
+                    result['ls_source'] = 'OKX'
+                    logger.info(f"多空比(OKX): {result['long_short_ratio']:.2f}")
+        except Exception as e:
+            logger.warning(f"OKX多空比失败: {e}")
+
+    # Bitget备选
+    if result['long_short_ratio'] is None:
+        try:
+            r = requests.get('https://api.bitget.com/api/v2/mix/market/account-long-short',
+                             params={'symbol': 'BTCUSDT', 'productType': 'USDT-FUTURES'},
+                             headers=HEADERS, timeout=TIMEOUT)
+            if r.status_code == 200 and r.json().get('code') == '0':
+                data = r.json().get('data', {})
+                if data:
+                    long_amt = float(data.get('longAmount', 0))
+                    short_amt = float(data.get('shortAmount', 1))
+                    if short_amt > 0:
+                        result['long_short_ratio'] = long_amt / short_amt
+                        result['ls_source'] = 'Bitget'
+                        logger.info(f"多空比(Bitget): {result['long_short_ratio']:.2f}")
+        except Exception as e:
+            logger.warning(f"Bitget多空比失败: {e}")
 
     return result
 
@@ -838,6 +878,9 @@ def format_message(price, mvrv, nupl, etf, fg, funding, macro, weekly, deriv, fe
             prob_parts.append(f"加息{fed_prob['hike_prob']:.0f}%")
         if prob_parts:
             L.append(f"🎯 <b>Polymarket利率预期</b>：{' | '.join(prob_parts)}")
+    else:
+        err = fed_prob.get('error', '')
+        L.append(f"🎯 <b>Polymarket利率预期</b>：获取失败{('（'+err+'）') if err else ''}")
     L.append("")
 
     # ===== 四、资金流 =====
@@ -871,6 +914,8 @@ def format_message(price, mvrv, nupl, etf, fg, funding, macro, weekly, deriv, fe
         ls = deriv['long_short_ratio']
         ls_tag = '🟡多头拥挤' if ls > 1.5 else ('🟢空头拥挤' if ls < 0.7 else '⚪中性')
         L.append(f"👥 <b>散户多空比</b>：{ls:.2f}  {ls_tag}")
+    else:
+        L.append("👥 <b>散户多空比</b>：获取失败")
     L.append("")
 
     # ===== 信号预警 =====
