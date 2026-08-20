@@ -303,11 +303,11 @@ def check_signals(price_data, mvrv_data, etf_data, fg_data, funding_data) -> Lis
     if mvrv_data.get('mvrv') is not None:
         m = mvrv_data['mvrv']
         if m < SIGNAL_THRESHOLDS['mvrv_bottom']:
-            signals.append(f"🔴 MVRV={m:.2f} < 1.0 → 历史深度底部区域")
+            signals.append(f"🔴 MVRV={m:.2f} &lt; 1.0 → 历史深度底部区域")
         elif m < SIGNAL_THRESHOLDS['mvrv_low']:
-            signals.append(f"🟡 MVRV={m:.2f} < 1.5 → 偏低估值区域")
+            signals.append(f"🟡 MVRV={m:.2f} &lt; 1.5 → 偏低估值区域")
         elif m > SIGNAL_THRESHOLDS['mvrv_top']:
-            signals.append(f"🔴 MVRV={m:.2f} > 3.5 → 历史顶部区域")
+            signals.append(f"🔴 MVRV={m:.2f} &gt; 3.5 → 历史顶部区域")
 
     # ETF信号
     if etf_data.get('daily_flow_m') is not None:
