@@ -508,113 +508,71 @@ def fetch_fed_probability(macro: Dict[str, Any] = None) -> Dict[str, Any]:
             logger.info(f"CME FedWatch JSON keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
             logger.info(f"CME FedWatch JSON preview: {json.dumps(data, ensure_ascii=False)[:1500]}")
 
-            # 尝试解析CME FedWatch数据
-            # CME数据结构可能是: {"meetings": [{"meetingDate": "...", "rateRanges": [{"range": "3.50-3.75", "probability": 67.3}, ...]}]}
+            # 解析CME FedWatch数据（真实结构: {"meetings": [{"meetingDate": "...", "probabilities": [{"change": "0"/"+25"/"-25", "prob": 67.3}]}]}）
             meetings = None
             if isinstance(data, dict):
-                # 尝试多种可能的key
-                for key in ['meetings', 'meetingList', 'data', 'fedWatch', 'results']:
+                for key in ['meetings', 'meetingList', 'data']:
                     if key in data and isinstance(data[key], list):
                         meetings = data[key]
                         break
-                if meetings is None and 'meetingDate' in data:
-                    meetings = [data]
+                if meetings is None and isinstance(data.get('data'), dict):
+                    for key in ['meetings', 'meetingList']:
+                        if key in data['data'] and isinstance(data['data'][key], list):
+                            meetings = data['data'][key]
+                            break
             elif isinstance(data, list):
                 meetings = data
 
             if meetings and len(meetings) > 0:
-                # 取最近的一次会议
+                # 取最近的一次会议（第一个通常是最近的）
                 latest = meetings[0]
                 meeting_date = latest.get('meetingDate') or latest.get('date') or latest.get('meeting_date')
                 result['meeting_date'] = meeting_date
 
-                # 提取利率区间概率
-                rate_ranges = None
-                for key in ['rateRanges', 'rate_ranges', 'ranges', 'probabilities', 'targetRates']:
-                    if key in latest and isinstance(latest[key], list):
-                        rate_ranges = latest[key]
-                        break
-                if rate_ranges is None and isinstance(latest, list):
-                    rate_ranges = latest
+                # 提取probabilities（CME真实字段）
+                probs_raw = latest.get('probabilities') or latest.get('prob') or []
+                if not probs_raw and isinstance(latest, list):
+                    probs_raw = latest
 
-                if rate_ranges:
-                    result['rate_ranges'] = rate_ranges
-                    logger.info(f"CME会议: {meeting_date}, 区间数: {len(rate_ranges)}")
-                    logger.info(f"CME区间详情: {json.dumps(rate_ranges, ensure_ascii=False)[:1000]}")
+                if probs_raw:
+                    logger.info(f"CME会议: {meeting_date}, 概率项数: {len(probs_raw)}")
+                    logger.info(f"CME概率详情: {json.dumps(probs_raw, ensure_ascii=False)[:1000]}")
 
-                    # 解析每个区间的概率
-                    parsed_ranges = []
-                    for rr in rate_ranges:
-                        if isinstance(rr, dict):
-                            rng = rr.get('range') or rr.get('targetRange') or rr.get('rate') or rr.get('label') or ''
-                            prob = rr.get('probability') or rr.get('prob') or rr.get('value') or rr.get('pct')
-                            if prob is not None:
-                                parsed_ranges.append({'range': str(rng), 'prob': float(prob)})
-                        elif isinstance(rr, (list, tuple)) and len(rr) >= 2:
-                            parsed_ranges.append({'range': str(rr[0]), 'prob': float(rr[1])})
+                    hold_prob = 0.0
+                    hike_prob = 0.0
+                    cut_prob = 0.0
 
-                    if parsed_ranges:
-                        # 找到当前利率区间（概率最高的通常是当前区间或预期区间）
-                        # 计算加息/降息/维持概率
-                        # 当前联邦基金利率目标区间
-                        current_rate = macro.get('fed_funds') if macro else None
-                        current_low = None
-                        current_high = None
-                        if current_rate is not None:
-                            # 当前利率是区间中点，推算区间
-                            current_low = round(current_rate - 0.125, 2)
-                            current_high = round(current_rate + 0.125, 2)
+                    for p in probs_raw:
+                        if not isinstance(p, dict):
+                            continue
+                        # change字段: "0"=维持, "+25"/"25"=加息25bp, "-25"=降息25bp, "+50"=加息50bp, "-50"=降息50bp
+                        change = str(p.get('change') or p.get('bps') or p.get('rateChange') or '0').strip().upper()
+                        # prob字段: 百分比数值（如67.3表示67.3%）
+                        prob_val = p.get('prob') or p.get('probability') or p.get('value') or p.get('pct') or 0
+                        try:
+                            prob_val = float(prob_val)
+                        except:
+                            prob_val = 0.0
 
-                        hold_prob = 0
-                        hike_prob = 0
-                        cut_prob = 0
-                        for pr in parsed_ranges:
-                            rng = pr['range']
-                            prob = pr['prob']
-                            # 解析区间上下限
-                            try:
-                                # 格式如 "3.50-3.75" 或 "3.50%-3.75%"
-                                clean = rng.replace('%', '').replace(' ', '')
-                                parts = clean.split('-')
-                                if len(parts) == 2:
-                                    low = float(parts[0])
-                                    high = float(parts[1])
-                                    if current_low is not None and current_high is not None:
-                                        if abs(low - current_low) < 0.01 and abs(high - current_high) < 0.01:
-                                            hold_prob += prob
-                                        elif low > current_high + 0.01:
-                                            hike_prob += prob
-                                        elif high < current_low - 0.01:
-                                            cut_prob += prob
-                                    else:
-                                        # 无法确定当前区间，用概率最高的作为维持
-                                        pass
-                            except:
-                                pass
+                        if change in ('0', 'UNCH', 'UNCHANGED', 'HOLD', '0BP', '0.00'):
+                            hold_prob += prob_val
+                        elif change.startswith('+') or change in ('25', '50', '75', '100', 'HIKE', 'RAISE', 'INCREASE'):
+                            hike_prob += prob_val
+                        elif change.startswith('-') or change in ('-25', '-50', '-75', '-100', 'CUT', 'LOWER', 'DECREASE'):
+                            cut_prob += prob_val
 
-                        # 如果无法通过区间判断，用概率最高的作为维持
-                        if hold_prob == 0 and hike_prob == 0 and cut_prob == 0 and parsed_ranges:
-                            sorted_ranges = sorted(parsed_ranges, key=lambda x: x['prob'], reverse=True)
-                            hold_prob = sorted_ranges[0]['prob']
-                            if len(sorted_ranges) > 1:
-                                # 假设第二个是加息或降息
-                                hike_prob = sorted_ranges[1]['prob']
+                    total = hold_prob + hike_prob + cut_prob
+                    if total > 0:
+                        # CME的prob已经是百分比，直接使用（可能总和接近100）
+                        result['hold_prob'] = round(hold_prob, 1)
+                        result['hike_prob'] = round(hike_prob, 1)
+                        result['cut_prob'] = round(cut_prob, 1)
 
-                        total = hold_prob + hike_prob + cut_prob
-                        if total > 0:
-                            # 归一化到100%
-                            result['hold_prob'] = round(hold_prob / total * 100, 1)
-                            result['hike_prob'] = round(hike_prob / total * 100, 1)
-                            result['cut_prob'] = round(cut_prob / total * 100, 1)
-                        else:
-                            result['hold_prob'] = round(hold_prob, 1)
-                            result['hike_prob'] = round(hike_prob, 1)
-                            result['cut_prob'] = round(cut_prob, 1)
-
-                        result['current_rate'] = current_rate
-                        result['source'] = 'CME FedWatch'
-                        logger.info(f"CME FedWatch: 会议={meeting_date}, 加息={result['hike_prob']}%, 降息={result['cut_prob']}%, 维持={result['hold_prob']}%")
-                        return result
+                    current_rate = macro.get('fed_funds') if macro else None
+                    result['current_rate'] = current_rate
+                    result['source'] = 'CME FedWatch'
+                    logger.info(f"CME FedWatch: 会议={meeting_date}, 加息={result['hike_prob']}%, 降息={result['cut_prob']}%, 维持={result['hold_prob']}%")
+                    return result
     except Exception as e:
         logger.warning(f"CME FedWatch失败: {e}")
 
