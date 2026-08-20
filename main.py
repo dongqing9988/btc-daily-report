@@ -503,10 +503,20 @@ def fetch_fed_probability(macro: Dict[str, Any] = None) -> Dict[str, Any]:
         }
         r = requests.get('https://www.cmegroup.com/CmeWS/mvc/MktData/FedWatch.json',
                          headers=cme_headers, timeout=TIMEOUT)
+        logger.info(f"CME响应状态码: {r.status_code}, 内容长度: {len(r.text)}")
+        logger.info(f"CME响应前2000字符: {r.text[:2000]}")
         if r.status_code == 200:
-            data = r.json()
+            # 检查是否被阻止
+            if 'blocked' in r.text.lower() or 'scraping' in r.text.lower() or 'access denied' in r.text.lower():
+                logger.warning("CME FedWatch被反爬阻止")
+                raise Exception("CME反爬阻止")
+            try:
+                data = r.json()
+            except:
+                logger.warning(f"CME返回非JSON: {r.text[:500]}")
+                raise Exception("CME返回非JSON")
             logger.info(f"CME FedWatch JSON keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
-            logger.info(f"CME FedWatch JSON preview: {json.dumps(data, ensure_ascii=False)[:1500]}")
+            logger.info(f"CME FedWatch JSON完整: {json.dumps(data, ensure_ascii=False)[:3000]}")
 
             # 解析CME FedWatch数据（真实结构: {"meetings": [{"meetingDate": "...", "probabilities": [{"change": "0"/"+25"/"-25", "prob": 67.3}]}]}）
             meetings = None
