@@ -287,8 +287,13 @@ def fetch_etf_flows() -> Dict[str, Any]:
                             full_data = parse_farside_table(r2.text)
                             if full_data:
                                 result['cumulative_m'] = sum(f for _, f in full_data)
+                                result['cumulative_type'] = '全部历史'
                     except:
                         pass
+                    # 如果完整页失败，用近期数据累加
+                    if result['cumulative_m'] is None and daily_data:
+                        result['cumulative_m'] = sum(f for _, f in daily_data)
+                        result['cumulative_type'] = f'近{len(daily_data)}个交易日'
                     logger.info(f"ETF(farside): {latest_date} ${latest_flow:+.1f}M, 连续{consecutive}天, 累计${result.get('cumulative_m',0):,.0f}M")
                     return result
                 else:
@@ -396,37 +401,9 @@ def fetch_macro_fred() -> Dict[str, Any]:
 
 def fetch_fed_probability() -> Dict[str, Any]:
     result = {'cut_prob': None, 'hike_prob': None, 'market_question': None, 'error': None}
-    try:
-        # 搜索美联储相关市场
-        r = requests.get('https://gamma-api.polymarket.com/markets',
-                         params={'search': 'fed rate', 'closed': 'false', 'limit': 20,
-                                 'order': 'volume24hr', 'ascending': 'false'},
-                         headers=HEADERS, timeout=TIMEOUT)
-        if r.status_code != 200:
-            result['error'] = f"HTTP {r.status_code}"
-            logger.warning(f"Polymarket搜索状态码: {r.status_code}")
-            return result
 
-        markets = r.json()
-        if not isinstance(markets, list) or not markets:
-            result['error'] = "无搜索结果"
-            logger.warning("Polymarket无搜索结果")
-            return result
-
-        # 找最相关的市场
-        best_market = None
-        for m in markets:
-            q = str(m.get('question', '')).lower()
-            if any(kw in q for kw in ['fed', 'fomc', 'rate', 'interest', 'cut', 'hike', 'powell']):
-                best_market = m
-                break
-
-        if not best_market:
-            result['error'] = "未找到美联储相关市场"
-            logger.warning("Polymarket未找到美联储相关市场")
-            return result
-
-        result['market_question'] = best_market.get('question')
+    def parse_outcomes(best_market):
+        result['market_question'] = best_market.get('question') or best_market.get('title')
         outcomes = best_market.get('outcomes', '[]')
         prices = best_market.get('outcomePrices', '[]')
         if isinstance(outcomes, str):
@@ -439,19 +416,75 @@ def fetch_fed_probability() -> Dict[str, Any]:
                 prices = json.loads(prices)
             except:
                 prices = []
-
         for o, p in zip(outcomes, prices):
             try:
                 prob = float(p) * 100
             except:
                 continue
             o_lower = str(o).lower()
-            if any(kw in o_lower for kw in ['cut', '降', '降息', 'lower']):
+            if any(kw in o_lower for kw in ['cut', '降', '降息', 'lower', 'decrease', 'reduce']):
                 result['cut_prob'] = prob
-            elif any(kw in o_lower for kw in ['hike', '加', '加息', 'raise', 'higher']):
+            elif any(kw in o_lower for kw in ['hike', '加', '加息', 'raise', 'higher', 'increase']):
                 result['hike_prob'] = prob
 
-        logger.info(f"Polymarket: {str(result['market_question'])[:50]}... 降息={result['cut_prob']}%, 加息={result['hike_prob']}%")
+    try:
+        # 搜索markets
+        r = requests.get('https://gamma-api.polymarket.com/markets',
+                         params={'search': 'fed rate', 'closed': 'false', 'limit': 30,
+                                 'order': 'volume24hr', 'ascending': 'false'},
+                         headers=HEADERS, timeout=TIMEOUT)
+        markets = []
+        if r.status_code == 200:
+            markets = r.json()
+            if not isinstance(markets, list):
+                markets = []
+
+        # 搜索events（events包含多个markets）
+        try:
+            r2 = requests.get('https://gamma-api.polymarket.com/events',
+                              params={'search': 'fed rate', 'closed': 'false', 'limit': 10,
+                                      'order': 'volume24hr', 'ascending': 'false'},
+                              headers=HEADERS, timeout=TIMEOUT)
+            if r2.status_code == 200:
+                events = r2.json()
+                if isinstance(events, list):
+                    for ev in events:
+                        ev_markets = ev.get('markets', [])
+                        if isinstance(ev_markets, list):
+                            markets.extend(ev_markets)
+        except:
+            pass
+
+        if not markets:
+            result['error'] = "无搜索结果"
+            logger.warning("Polymarket无搜索结果")
+            return result
+
+        # 找最相关的市场
+        best_market = None
+        keywords = ['fed', 'fomc', 'rate', 'interest', 'cut', 'hike', 'powell', '降息', '加息']
+        for m in markets:
+            q = str(m.get('question', '') + ' ' + m.get('title', '')).lower()
+            if any(kw in q for kw in keywords):
+                # 优先选有outcomes的
+                if m.get('outcomes'):
+                    best_market = m
+                    break
+
+        if not best_market:
+            # 降级：选第一个有outcomes的
+            for m in markets:
+                if m.get('outcomes'):
+                    best_market = m
+                    break
+
+        if not best_market:
+            result['error'] = "未找到有效市场"
+            logger.warning("Polymarket未找到有效市场")
+            return result
+
+        parse_outcomes(best_market)
+        logger.info(f"Polymarket: {str(result['market_question'])[:60]}... 降息={result['cut_prob']}%, 加息={result['hike_prob']}%")
     except Exception as e:
         result['error'] = str(e)
         logger.warning(f"Polymarket失败: {e}")
@@ -463,28 +496,64 @@ def fetch_fed_probability() -> Dict[str, Any]:
 def fetch_btc_weekly() -> Dict[str, Any]:
     result = {'sma200w': None, 'current_price': None, 'deviation_200w': None, 'source': None}
 
-    # 方案1: Coinbase（美国交易所，对美国IP友好）
+    # 方案1: CoinGecko历史价格（支持全部历史，美国IP友好）
     try:
-        r = requests.get('https://api.exchange.coinbase.com/products/BTC-USD/candles',
-                         params={'granularity': 604800, 'limit': 210},  # 604800秒=1周
+        r = requests.get('https://api.coingecko.com/api/v3/coins/bitcoin/market_chart',
+                         params={'vs_currency': 'usd', 'days': 'max', 'interval': 'daily'},
                          headers={**HEADERS, 'Accept': 'application/json'}, timeout=TIMEOUT)
         if r.status_code == 200:
-            klines = r.json()
-            # Coinbase返回 [time, low, high, open, close, volume]，按时间倒序
-            closes = [safe_float(k[4]) for k in klines]
+            prices = r.json().get('prices', [])
+            # prices = [[timestamp_ms, price], ...]
+            closes = [safe_float(p[1]) for p in prices]
             closes = [c for c in closes if c is not None]
-            closes.reverse()  # 转为正序
-            if len(closes) >= 200:
-                result['sma200w'] = sum(closes[-200:]) / 200
-                result['current_price'] = closes[-1]
-                result['deviation_200w'] = (closes[-1] - result['sma200w']) / result['sma200w'] * 100
+            if len(closes) >= 1400:  # 约200周
+                # 取最后1400天，每7天取一个收盘价计算周线SMA
+                weekly_closes = closes[-1400::7]
+                if len(weekly_closes) >= 200:
+                    result['sma200w'] = sum(weekly_closes[-200:]) / 200
+                    result['current_price'] = closes[-1]
+                    result['deviation_200w'] = (closes[-1] - result['sma200w']) / result['sma200w'] * 100
+                    result['source'] = 'CoinGecko'
+                    logger.info(f"200周SMA(CoinGecko): ${result['sma200w']:,.0f}, 当前: ${closes[-1]:,.0f}, 偏离: {result['deviation_200w']:+.1f}%")
+                    return result
+    except Exception as e:
+        logger.warning(f"CoinGecko周线失败: {e}")
+
+    # 方案2: Coinbase日线聚合（Coinbase不支持周线granularity，用日线自己聚合）
+    try:
+        all_closes = []
+        # Coinbase每次最多300条，分多次请求
+        end = int(time.time())
+        for batch in range(5):  # 5*300=1500天
+            start = end - 300 * 86400
+            r = requests.get('https://api.exchange.coinbase.com/products/BTC-USD/candles',
+                             params={'granularity': 86400, 'start': start, 'end': end},
+                             headers={**HEADERS, 'Accept': 'application/json'}, timeout=TIMEOUT)
+            if r.status_code == 200:
+                klines = r.json()
+                batch_closes = [safe_float(k[4]) for k in klines]
+                batch_closes = [c for c in batch_closes if c is not None]
+                all_closes.extend(batch_closes)
+                end = start
+                if len(batch_closes) < 300:
+                    break
+            else:
+                break
+            time.sleep(0.3)
+        if len(all_closes) >= 1400:
+            all_closes.reverse()  # 正序
+            weekly_closes = all_closes[-1400::7]
+            if len(weekly_closes) >= 200:
+                result['sma200w'] = sum(weekly_closes[-200:]) / 200
+                result['current_price'] = all_closes[-1]
+                result['deviation_200w'] = (all_closes[-1] - result['sma200w']) / result['sma200w'] * 100
                 result['source'] = 'Coinbase'
-                logger.info(f"200周SMA(Coinbase): ${result['sma200w']:,.0f}, 当前: ${closes[-1]:,.0f}, 偏离: {result['deviation_200w']:+.1f}%")
+                logger.info(f"200周SMA(Coinbase): ${result['sma200w']:,.0f}, 当前: ${all_closes[-1]:,.0f}, 偏离: {result['deviation_200w']:+.1f}%")
                 return result
     except Exception as e:
-        logger.warning(f"Coinbase周线失败: {e}")
+        logger.warning(f"Coinbase日线聚合失败: {e}")
 
-    # 方案2: Binance
+    # 方案3: Binance
     try:
         r = requests.get('https://api.binance.com/api/v3/klines',
                          params={'symbol': 'BTCUSDT', 'interval': '1w', 'limit': 210},
@@ -538,6 +607,22 @@ def fetch_derivatives() -> Dict[str, Any]:
         except Exception as e:
             logger.warning(f"Bybit OI失败: {e}")
 
+    # Kraken备选（美国交易所，对美IP友好）
+    if result['open_interest'] is None:
+        try:
+            r = requests.get('https://futures.kraken.com/derivatives/api/v3/tickers',
+                             headers=HEADERS, timeout=TIMEOUT)
+            if r.status_code == 200:
+                tickers = r.json().get('tickers', [])
+                for t in tickers:
+                    if t.get('symbol') == 'PI_XBTUSD':
+                        result['open_interest'] = float(t.get('openInterest', 0))
+                        result['oi_source'] = 'Kraken'
+                        logger.info(f"OI(Kraken): {result['open_interest']:,.0f} BTC")
+                        break
+        except Exception as e:
+            logger.warning(f"Kraken OI失败: {e}")
+
     # ===== 多空比 =====
     # Binance
     try:
@@ -564,11 +649,33 @@ def fetch_derivatives() -> Dict[str, Any]:
             if r.status_code == 200 and r.json().get('retCode') == 0:
                 data = r.json().get('result', {}).get('list', [])
                 if data:
-                    result['long_short_ratio'] = float(data[0].get('buyRatio', 0)) / float(data[0].get('sellRatio', 1))
-                    result['ls_source'] = 'Bybit'
-                    logger.info(f"多空比(Bybit): {result['long_short_ratio']:.2f}")
+                    buy_ratio = float(data[0].get('buyRatio', 0))
+                    sell_ratio = float(data[0].get('sellRatio', 1))
+                    if sell_ratio > 0:
+                        result['long_short_ratio'] = buy_ratio / sell_ratio
+                        result['ls_source'] = 'Bybit'
+                        logger.info(f"多空比(Bybit): {result['long_short_ratio']:.2f}")
         except Exception as e:
             logger.warning(f"Bybit多空比失败: {e}")
+
+    # Coinglass公开API备选
+    if result['long_short_ratio'] is None:
+        try:
+            r = requests.get('https://open-api.coinglass.com/public/v2/long_short_ratio',
+                             params={'symbol': 'BTC'},
+                             headers={**HEADERS, 'Accept': 'application/json'}, timeout=TIMEOUT)
+            if r.status_code == 200:
+                data = r.json()
+                # Coinglass返回格式可能是 {"data": {"longShortRatioList": [...]}}
+                if isinstance(data, dict):
+                    ls_list = data.get('data', {}).get('longShortRatioList', [])
+                    if ls_list:
+                        latest = ls_list[-1]
+                        result['long_short_ratio'] = float(latest.get('longShortRatio', 0))
+                        result['ls_source'] = 'Coinglass'
+                        logger.info(f"多空比(Coinglass): {result['long_short_ratio']:.2f}")
+        except Exception as e:
+            logger.warning(f"Coinglass多空比失败: {e}")
 
     return result
 
