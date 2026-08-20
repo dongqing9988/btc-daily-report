@@ -190,65 +190,86 @@ def fetch_etf_flows() -> Dict[str, Any]:
         'recent_flows': [],      # 最近N天数据
         'latest_date': None
     }
-    try:
-        r = requests.get('https://farside.co.uk/btc/', headers=HEADERS, timeout=TIMEOUT)
-        if r.status_code != 200:
-            logger.warning(f"farside状态码: {r.status_code}")
+
+    def parse_num(s: str) -> Optional[float]:
+        """解析数字，处理括号表示负数、逗号、破折号"""
+        s = s.strip().replace(',', '')
+        if s in ('', '-', '—'):
+            return 0.0
+        if s.startswith('(') and s.endswith(')'):
+            s = '-' + s[1:-1]
+        try:
+            return float(s)
+        except ValueError:
+            return None
+
+    # 重试2次
+    for attempt in range(3):
+        try:
+            r = requests.get('https://farside.co.uk/btc/', headers=HEADERS, timeout=TIMEOUT)
+            if r.status_code != 200:
+                logger.warning(f"farside状态码: {r.status_code} (尝试{attempt+1}/3)")
+                if attempt < 2:
+                    time.sleep(3)
+                    continue
+                return result
+
+            soup = BeautifulSoup(r.text, 'lxml')
+            tables = soup.find_all('table')
+            if not tables:
+                logger.warning("未找到表格")
+                return result
+
+            # 第一个表格是ETF资金流
+            table = tables[0]
+            rows = table.find_all('tr')
+
+            daily_data = []  # [(date_str, total_million)]
+            for row in rows:
+                cells = [c.get_text(strip=True) for c in row.find_all(['th', 'td'])]
+                if len(cells) < 14:
+                    continue
+                # 第一列是日期，最后一列是Total
+                date_str = cells[0]
+                total_str = cells[-1]
+                # 检查是否是日期行（如 "03 Aug 2026"）
+                if not any(month in date_str for month in ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']):
+                    continue
+                total_m = parse_num(total_str)
+                if total_m is not None:
+                    daily_data.append((date_str, total_m))
+
+            if not daily_data:
+                logger.warning("未解析到ETF数据")
+                if attempt < 2:
+                    time.sleep(3)
+                    continue
+                return result
+
+            # 取最近10天
+            recent = daily_data[-10:] if len(daily_data) >= 10 else daily_data
+
+            latest_date, latest_flow = recent[-1]
+            result['daily_flow_m'] = latest_flow
+            result['latest_date'] = latest_date
+            result['recent_flows'] = recent
+
+            # 计算连续流入天数（从最新一天往前数）
+            consecutive = 0
+            for _, flow in reversed(recent):
+                if flow > 0:
+                    consecutive += 1
+                else:
+                    break
+            result['consecutive_days'] = consecutive
+
+            logger.info(f"ETF: {latest_date} 净流入 ${latest_flow:+.1f}M, 连续流入 {consecutive} 天")
             return result
+        except Exception as e:
+            logger.warning(f"ETF资金流获取失败 (尝试{attempt+1}/3): {e}")
+            if attempt < 2:
+                time.sleep(3)
 
-        soup = BeautifulSoup(r.text, 'lxml')
-        tables = soup.find_all('table')
-        if not tables:
-            logger.warning("未找到表格")
-            return result
-
-        # 第一个表格是ETF资金流
-        table = tables[0]
-        rows = table.find_all('tr')
-
-        daily_data = []  # [(date_str, total_million)]
-        for row in rows:
-            cells = [c.get_text(strip=True) for c in row.find_all(['th', 'td'])]
-            if len(cells) < 14:
-                continue
-            # 第一列是日期，最后一列是Total
-            date_str = cells[0]
-            total_str = cells[-1]
-            # 检查是否是日期行（如 "03 Aug 2026"）
-            if not any(month in date_str for month in ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']):
-                continue
-            try:
-                total_m = float(total_str.replace(',', ''))
-                daily_data.append((date_str, total_m))
-            except ValueError:
-                continue
-
-        if not daily_data:
-            logger.warning("未解析到ETF数据")
-            return result
-
-        # 数据按日期正序（表格里可能是倒序，取最后一个为最新）
-        # farside表格通常是日期倒序（最新在最上面），但解析后顺序可能不确定
-        # 取最近10天
-        recent = daily_data[-10:] if len(daily_data) >= 10 else daily_data
-
-        latest_date, latest_flow = recent[-1]
-        result['daily_flow_m'] = latest_flow
-        result['latest_date'] = latest_date
-        result['recent_flows'] = recent
-
-        # 计算连续流入天数（从最新一天往前数）
-        consecutive = 0
-        for _, flow in reversed(recent):
-            if flow > 0:
-                consecutive += 1
-            else:
-                break
-        result['consecutive_days'] = consecutive
-
-        logger.info(f"ETF: {latest_date} 净流入 ${latest_flow:+.1f}M, 连续流入 {consecutive} 天")
-    except Exception as e:
-        logger.warning(f"ETF资金流获取失败: {e}")
     return result
 
 
@@ -364,9 +385,10 @@ def format_message(price_data, mvrv_data, etf_data, fg_data, funding_data, signa
             'deep_bottom': '🔴', 'low': '🟡', 'neutral': '⚪',
             'high': '🟡', 'top': '🔴'
         }.get(mvrv_data.get('zone'), '⚪')
-        lines.append(f"📈 <b>MVRV</b>：{mvrv_data['mvrv']:.2f}  {zone_emoji} {mvrv_data.get('zone_label', '')}")
+        mvrv_line = f"📈 <b>MVRV</b>：{mvrv_data['mvrv']:.2f}  {zone_emoji} {mvrv_data.get('zone_label', '')}"
         if mvrv_data.get('realized_price'):
-            lines.append(f"   已实现价格：${mvrv_data['realized_price']:,.0f}")
+            mvrv_line += f"  |  已实现价格：${mvrv_data['realized_price']:,.0f}"
+        lines.append(mvrv_line)
         lines.append(f"   阈值参考：&lt;1.0底部 | 1.0-1.5偏低 | 1.5-2.5中性 | &gt;3.5顶部")
     else:
         lines.append("📈 <b>MVRV</b>：获取失败")
@@ -376,8 +398,6 @@ def format_message(price_data, mvrv_data, etf_data, fg_data, funding_data, signa
         flow = etf_data['daily_flow_m']
         emoji = '🟢' if flow >= 0 else '🔴'
         lines.append(f"💵 <b>ETF资金流</b>：{emoji} ${flow:+.1f}M  |  连续流入：{etf_data.get('consecutive_days', 0)}天")
-        if etf_data.get('latest_date'):
-            lines.append(f"   数据日期：{etf_data['latest_date']}")
     else:
         lines.append("💵 <b>ETF资金流</b>：获取失败")
 
@@ -413,6 +433,14 @@ def format_message(price_data, mvrv_data, etf_data, fg_data, funding_data, signa
         for sig in signals:
             lines.append(f"  {sig}")
 
+    lines.append("")
+    lines.append("——————————")
+    lines.append("📖 <b>指标释义</b>")
+    lines.append("• <b>MVRV</b>：市价÷链上持仓成本，衡量市场整体估值高低")
+    lines.append("• <b>已实现价格</b>：链上所有BTC的平均持仓成本价")
+    lines.append("• <b>ETF资金流</b>：BTC现货ETF每日资金进出，代表机构动向")
+    lines.append("• <b>恐慌贪婪指数</b>：市场情绪，0极度恐慌～100极度贪婪")
+    lines.append("• <b>资金费率</b>：永续合约多空成本，正数多头付费，负数空头付费")
     lines.append("")
     lines.append("<i>数据来源：Binance/bitbo.io/Alternative.me/farside.co.uk</i>")
 
