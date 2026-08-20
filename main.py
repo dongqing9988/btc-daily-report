@@ -405,22 +405,37 @@ def fetch_macro_fred() -> Dict[str, Any]:
         except Exception as e:
             logger.warning(f"FRED {key}({series_id})失败: {e}")
 
-    # CPI同比：需要当前值和一年前的值
+    # CPI同比：需要当前值和正好12个月前的值
     try:
         r = requests.get('https://api.stlouisfed.org/fred/series/observations',
                          params={'series_id': 'CPIAUCSL', 'api_key': FRED_API_KEY,
-                                 'file_type': 'json', 'limit': 15, 'sort_order': 'desc'},
+                                 'file_type': 'json', 'limit': 20, 'sort_order': 'desc'},
                          headers=HEADERS, timeout=TIMEOUT)
         if r.status_code == 200:
             obs = r.json().get('observations', [])
             vals = [(o.get('date'), safe_float(o.get('value'))) for o in obs]
             vals = [(d, v) for d, v in vals if v is not None]
-            if len(vals) >= 13:
-                current = vals[0][1]
-                year_ago = vals[-1][1]
-                if year_ago > 0:
+            if len(vals) >= 2:
+                current_date, current = vals[0]
+                # 计算12个月前的目标月份
+                from datetime import datetime
+                cur_dt = datetime.strptime(current_date, '%Y-%m-%d')
+                target_year = cur_dt.year - 1
+                target_month = cur_dt.month
+                target_str = f"{target_year}-{target_month:02d}"
+                # 找到正好12个月前的数据
+                year_ago = None
+                for d, v in vals:
+                    if d.startswith(target_str):
+                        year_ago = v
+                        break
+                # 如果没找到正好12个月前的，用最接近的（第13条左右）
+                if year_ago is None and len(vals) >= 13:
+                    year_ago = vals[12][1]
+                    logger.info(f"CPI: 未找到{target_str}，使用{vals[12][0]}")
+                if year_ago is not None and year_ago > 0:
                     result['cpi_yoy'] = (current / year_ago - 1) * 100
-                    logger.info(f"CPI同比: {result['cpi_yoy']:.2f}% (当前={current}, 一年前={year_ago})")
+                    logger.info(f"CPI同比: {result['cpi_yoy']:.2f}% (当前={current}@{current_date}, 一年前={year_ago}@{target_str})")
     except Exception as e:
         logger.warning(f"FRED CPI同比失败: {e}")
 
@@ -474,7 +489,138 @@ def _kalshi_auth_headers(method: str, path: str) -> Dict[str, str]:
 def fetch_fed_probability(macro: Dict[str, Any] = None) -> Dict[str, Any]:
     result = {'cut_prob': None, 'hike_prob': None, 'hold_prob': None,
               'theoretical_rate': None, 'current_rate': None, 'cpi_yoy': None,
-              'unrate': None, 'inflation_exp': None, 'error': None, 'source': 'FRED泰勒规则'}
+              'unrate': None, 'inflation_exp': None, 'error': None, 'source': 'CME FedWatch',
+              'meeting_date': None, 'rate_ranges': None}
+
+    # ===== 方案1: CME FedWatch JSON接口（真实市场预期）=====
+    try:
+        cme_headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': 'https://www.cmegroup.com/markets/interest-rates/cme-fedwatch-tool.html',
+            'Origin': 'https://www.cmegroup.com',
+        }
+        r = requests.get('https://www.cmegroup.com/CmeWS/mvc/MktData/FedWatch.json',
+                         headers=cme_headers, timeout=TIMEOUT)
+        if r.status_code == 200:
+            data = r.json()
+            logger.info(f"CME FedWatch JSON keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+            logger.info(f"CME FedWatch JSON preview: {json.dumps(data, ensure_ascii=False)[:1500]}")
+
+            # 尝试解析CME FedWatch数据
+            # CME数据结构可能是: {"meetings": [{"meetingDate": "...", "rateRanges": [{"range": "3.50-3.75", "probability": 67.3}, ...]}]}
+            meetings = None
+            if isinstance(data, dict):
+                # 尝试多种可能的key
+                for key in ['meetings', 'meetingList', 'data', 'fedWatch', 'results']:
+                    if key in data and isinstance(data[key], list):
+                        meetings = data[key]
+                        break
+                if meetings is None and 'meetingDate' in data:
+                    meetings = [data]
+            elif isinstance(data, list):
+                meetings = data
+
+            if meetings and len(meetings) > 0:
+                # 取最近的一次会议
+                latest = meetings[0]
+                meeting_date = latest.get('meetingDate') or latest.get('date') or latest.get('meeting_date')
+                result['meeting_date'] = meeting_date
+
+                # 提取利率区间概率
+                rate_ranges = None
+                for key in ['rateRanges', 'rate_ranges', 'ranges', 'probabilities', 'targetRates']:
+                    if key in latest and isinstance(latest[key], list):
+                        rate_ranges = latest[key]
+                        break
+                if rate_ranges is None and isinstance(latest, list):
+                    rate_ranges = latest
+
+                if rate_ranges:
+                    result['rate_ranges'] = rate_ranges
+                    logger.info(f"CME会议: {meeting_date}, 区间数: {len(rate_ranges)}")
+                    logger.info(f"CME区间详情: {json.dumps(rate_ranges, ensure_ascii=False)[:1000]}")
+
+                    # 解析每个区间的概率
+                    parsed_ranges = []
+                    for rr in rate_ranges:
+                        if isinstance(rr, dict):
+                            rng = rr.get('range') or rr.get('targetRange') or rr.get('rate') or rr.get('label') or ''
+                            prob = rr.get('probability') or rr.get('prob') or rr.get('value') or rr.get('pct')
+                            if prob is not None:
+                                parsed_ranges.append({'range': str(rng), 'prob': float(prob)})
+                        elif isinstance(rr, (list, tuple)) and len(rr) >= 2:
+                            parsed_ranges.append({'range': str(rr[0]), 'prob': float(rr[1])})
+
+                    if parsed_ranges:
+                        # 找到当前利率区间（概率最高的通常是当前区间或预期区间）
+                        # 计算加息/降息/维持概率
+                        # 当前联邦基金利率目标区间
+                        current_rate = macro.get('fed_funds') if macro else None
+                        current_low = None
+                        current_high = None
+                        if current_rate is not None:
+                            # 当前利率是区间中点，推算区间
+                            current_low = round(current_rate - 0.125, 2)
+                            current_high = round(current_rate + 0.125, 2)
+
+                        hold_prob = 0
+                        hike_prob = 0
+                        cut_prob = 0
+                        for pr in parsed_ranges:
+                            rng = pr['range']
+                            prob = pr['prob']
+                            # 解析区间上下限
+                            try:
+                                # 格式如 "3.50-3.75" 或 "3.50%-3.75%"
+                                clean = rng.replace('%', '').replace(' ', '')
+                                parts = clean.split('-')
+                                if len(parts) == 2:
+                                    low = float(parts[0])
+                                    high = float(parts[1])
+                                    if current_low is not None and current_high is not None:
+                                        if abs(low - current_low) < 0.01 and abs(high - current_high) < 0.01:
+                                            hold_prob += prob
+                                        elif low > current_high + 0.01:
+                                            hike_prob += prob
+                                        elif high < current_low - 0.01:
+                                            cut_prob += prob
+                                    else:
+                                        # 无法确定当前区间，用概率最高的作为维持
+                                        pass
+                            except:
+                                pass
+
+                        # 如果无法通过区间判断，用概率最高的作为维持
+                        if hold_prob == 0 and hike_prob == 0 and cut_prob == 0 and parsed_ranges:
+                            sorted_ranges = sorted(parsed_ranges, key=lambda x: x['prob'], reverse=True)
+                            hold_prob = sorted_ranges[0]['prob']
+                            if len(sorted_ranges) > 1:
+                                # 假设第二个是加息或降息
+                                hike_prob = sorted_ranges[1]['prob']
+
+                        total = hold_prob + hike_prob + cut_prob
+                        if total > 0:
+                            # 归一化到100%
+                            result['hold_prob'] = round(hold_prob / total * 100, 1)
+                            result['hike_prob'] = round(hike_prob / total * 100, 1)
+                            result['cut_prob'] = round(cut_prob / total * 100, 1)
+                        else:
+                            result['hold_prob'] = round(hold_prob, 1)
+                            result['hike_prob'] = round(hike_prob, 1)
+                            result['cut_prob'] = round(cut_prob, 1)
+
+                        result['current_rate'] = current_rate
+                        result['source'] = 'CME FedWatch'
+                        logger.info(f"CME FedWatch: 会议={meeting_date}, 加息={result['hike_prob']}%, 降息={result['cut_prob']}%, 维持={result['hold_prob']}%")
+                        return result
+    except Exception as e:
+        logger.warning(f"CME FedWatch失败: {e}")
+
+    # ===== 方案2: 泰勒规则（备选）=====
+    logger.info("CME FedWatch不可用，使用泰勒规则备选")
+    result['source'] = '泰勒规则(备选)'
 
     if macro is None:
         result['error'] = '无宏观数据'
@@ -494,8 +640,9 @@ def fetch_fed_probability(macro: Dict[str, Any] = None) -> Dict[str, Any]:
     result['unrate'] = unrate
     result['inflation_exp'] = inflation_exp
 
-    # 泰勒规则：理论利率 = 通胀率 + 均衡实际利率(2%) + 0.5*(通胀率-目标2%) + 0.5*(自然失业率4%-当前失业率)
-    theoretical = cpi_yoy + 2 + 0.5 * (cpi_yoy - 2) + 0.5 * (4 - unrate)
+    # 泰勒规则：理论利率 = 通胀率 + 均衡实际利率(0.5%) + 0.5*(通胀率-目标2%) + 0.5*(自然失业率4%-当前失业率)
+    # 使用r*=0.5%（更符合当前低利率环境）
+    theoretical = cpi_yoy + 0.5 + 0.5 * (cpi_yoy - 2) + 0.5 * (4 - unrate)
     result['theoretical_rate'] = round(theoretical, 2)
 
     # 差值 = 理论利率 - 当前利率（正数=加息压力，负数=降息压力）
@@ -504,17 +651,17 @@ def fetch_fed_probability(macro: Dict[str, Any] = None) -> Dict[str, Any]:
     # 通胀预期调整
     if inflation_exp is not None:
         if inflation_exp > 2.5:
-            diff += 0.3  # 通胀预期高，加息压力增大
+            diff += 0.3
         elif inflation_exp < 1.5:
-            diff -= 0.3  # 通胀预期低，降息压力增大
+            diff -= 0.3
 
-    # 计算概率
-    if diff > 0.1:
-        hike_prob = min(diff / 1.5 * 100, 80)
-        cut_prob = max(5, 100 - hike_prob - 20)
-    elif diff < -0.1:
-        cut_prob = min(abs(diff) / 1.5 * 100, 80)
-        hike_prob = max(5, 100 - cut_prob - 20)
+    # 计算概率（更保守的映射）
+    if diff > 0.5:
+        hike_prob = min(diff / 2.0 * 100, 60)
+        cut_prob = max(5, 100 - hike_prob - 30)
+    elif diff < -0.5:
+        cut_prob = min(abs(diff) / 2.0 * 100, 60)
+        hike_prob = max(5, 100 - cut_prob - 30)
     else:
         hike_prob = 15
         cut_prob = 15
@@ -524,7 +671,7 @@ def fetch_fed_probability(macro: Dict[str, Any] = None) -> Dict[str, Any]:
     result['cut_prob'] = round(cut_prob, 1)
     result['hold_prob'] = round(hold_prob, 1)
 
-    logger.info(f"FRED泰勒规则: 当前={fed_funds}%, 理论={theoretical:.2f}%, 差值={diff:+.2f}%, 加息={hike_prob:.1f}%, 降息={cut_prob:.1f}%, 维持={hold_prob:.1f}%")
+    logger.info(f"泰勒规则(备选): 当前={fed_funds}%, 理论={theoretical:.2f}%, 差值={diff:+.2f}%, 加息={hike_prob:.1f}%, 降息={cut_prob:.1f}%, 维持={hold_prob:.1f}%")
     return result
 
 
@@ -837,9 +984,9 @@ def check_signals(price, mvrv, nupl, etf, fg, funding, macro, weekly, deriv, fed
 
     # 美联储概率
     if fed_prob.get('cut_prob') is not None and fed_prob['cut_prob'] > 70:
-        signals.append(f"🟢 Polymarket降息概率 {fed_prob['cut_prob']:.0f}% &gt; 70% → 市场计价宽松拐点")
+        signals.append(f"🟢 利率预期降息概率 {fed_prob['cut_prob']:.0f}% &gt; 70% → 市场计价宽松拐点")
     if fed_prob.get('hike_prob') is not None and fed_prob['hike_prob'] > 70:
-        signals.append(f"🔴 Polymarket加息概率 {fed_prob['hike_prob']:.0f}% &gt; 70% → 市场计价紧缩")
+        signals.append(f"🔴 利率预期加息概率 {fed_prob['hike_prob']:.0f}% &gt; 70% → 市场计价紧缩")
 
     return signals
 
@@ -914,7 +1061,18 @@ def format_message(price, mvrv, nupl, etf, fg, funding, macro, weekly, deriv, fe
         if fed_prob.get('hold_prob') is not None:
             prob_parts.append(f"维持{fed_prob['hold_prob']:.0f}%")
         if prob_parts:
-            L.append(f"🎯 <b>利率预期(泰勒规则)</b>：{' | '.join(prob_parts)}")
+            source = fed_prob.get('source', '')
+            if 'CME' in source:
+                title = '利率预期(CME FedWatch)'
+            elif '泰勒' in source:
+                title = '利率预期(泰勒规则)'
+            else:
+                title = '利率预期'
+            L.append(f"🎯 <b>{title}</b>：{' | '.join(prob_parts)}")
+            # 显示会议日期
+            if fed_prob.get('meeting_date'):
+                L.append(f"   下次FOMC会议：{fed_prob['meeting_date']}")
+            # 泰勒规则显示理论利率
             if fed_prob.get('theoretical_rate') is not None and fed_prob.get('current_rate') is not None:
                 diff = fed_prob['theoretical_rate'] - fed_prob['current_rate']
                 L.append(f"   当前{fed_prob['current_rate']}% → 理论{fed_prob['theoretical_rate']}%（差值{diff:+.2f}%）")
@@ -1001,7 +1159,7 @@ def format_message(price, mvrv, nupl, etf, fg, funding, macro, weekly, deriv, fe
     L.append("• <b>TIPS实际收益率</b>：扣除通胀后的真实利率，&gt;2%强紧缩")
     L.append("• <b>美元指数</b>：美元强弱，强美元周期BTC普遍承压")
     L.append("• <b>VIX</b>：美股波动率，&gt;30高恐慌，&lt;15极度平静")
-    L.append("• <b>利率预期</b>：泰勒规则计算，理论利率=CPI+2+0.5*(CPI-2)+0.5*(4-失业率)")
+    L.append("• <b>利率预期</b>：CME FedWatch市场预期（联邦基金期货隐含），备选泰勒规则模型")
     L.append("• <b>ETF资金流</b>：现货ETF每日资金进出，代表机构动向")
     L.append("• <b>资金费率</b>：永续合约多空成本，正数多头付费")
     L.append("• <b>OI未平仓量</b>：合约市场总持仓，反映市场参与度")
