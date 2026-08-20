@@ -492,7 +492,82 @@ def fetch_fed_probability(macro: Dict[str, Any] = None) -> Dict[str, Any]:
               'unrate': None, 'inflation_exp': None, 'error': None, 'source': 'CME FedWatch',
               'meeting_date': None, 'rate_ranges': None}
 
-    # ===== 方案1: CME FedWatch JSON接口（真实市场预期）=====
+    # ===== 方案1: cme-fedwatch包（CME Settlements API + curl_cffi模拟TLS）=====
+    try:
+        from cme_fedwatch import get_probabilities
+        data = get_probabilities("next")
+        logger.info(f"cme-fedwatch返回: effr={data.get('effr')}, target={data.get('current_target')}, meetings={len(data.get('meetings', []))}")
+
+        meetings = data.get('meetings', [])
+        if meetings:
+            latest = meetings[0]
+            meeting_date = latest.get('date')
+            result['meeting_date'] = meeting_date
+            probs = latest.get('probabilities', {})
+            current_target = data.get('current_target', '')  # 如 "3.50%-3.75%"
+
+            logger.info(f"cme-fedwatch会议: {meeting_date}, 当前目标: {current_target}, 概率分布: {probs}")
+
+            if probs:
+                # 解析当前目标区间
+                hold_prob = 0.0
+                hike_prob = 0.0
+                cut_prob = 0.0
+
+                # 解析当前目标区间上下限
+                current_low = None
+                current_high = None
+                try:
+                    parts = current_target.replace('%', '').split('-')
+                    if len(parts) == 2:
+                        current_low = float(parts[0])
+                        current_high = float(parts[1])
+                except:
+                    pass
+
+                for range_label, prob in probs.items():
+                    try:
+                        # range_label格式如 "3.50%-3.75%"
+                        clean = range_label.replace('%', '')
+                        rparts = clean.split('-')
+                        if len(rparts) == 2:
+                            low = float(rparts[0])
+                            high = float(rparts[1])
+                            prob_val = float(prob)
+
+                            if current_low is not None and current_high is not None:
+                                if abs(low - current_low) < 0.01 and abs(high - current_high) < 0.01:
+                                    hold_prob += prob_val
+                                elif low > current_high + 0.01:
+                                    hike_prob += prob_val
+                                elif high < current_low - 0.01:
+                                    cut_prob += prob_val
+                            else:
+                                # 无法确定当前区间，概率最高的作为维持
+                                pass
+                    except:
+                        pass
+
+                # 如果无法通过区间判断，用概率最高的作为维持
+                if hold_prob == 0 and hike_prob == 0 and cut_prob == 0 and probs:
+                    sorted_probs = sorted(probs.items(), key=lambda x: float(x[1]), reverse=True)
+                    hold_prob = float(sorted_probs[0][1])
+                    if len(sorted_probs) > 1:
+                        hike_prob = float(sorted_probs[1][1])
+
+                result['hold_prob'] = round(hold_prob, 1)
+                result['hike_prob'] = round(hike_prob, 1)
+                result['cut_prob'] = round(cut_prob, 1)
+                result['current_rate'] = data.get('effr')
+                result['source'] = 'CME FedWatch(期货)'
+                result['rate_ranges'] = probs
+
+                logger.info(f"cme-fedwatch: 会议={meeting_date}, 加息={result['hike_prob']}%, 降息={result['cut_prob']}%, 维持={result['hold_prob']}%")
+                return result
+    except Exception as e:
+        logger.warning(f"cme-fedwatch失败: {e}")
+
+    # ===== 方案2: CME FedWatch JSON接口（直接访问，可能被IP封锁）=====
     try:
         cme_headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
