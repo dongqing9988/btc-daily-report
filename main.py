@@ -405,97 +405,134 @@ def fetch_macro_fred() -> Dict[str, Any]:
     return result
 
 
-# ============ 8. Polymarket美联储利率概率 ============
+# ============ 8. Kalshi美联储利率概率（替代Polymarket） ============
+
+KALSHI_API_KEY = os.getenv('KALSHI_API_KEY', '')
+KALSHI_PRIVATE_KEY = os.getenv('KALSHI_PRIVATE_KEY', '')
+COINGLASS_API_KEY = os.getenv('COINGLASS_API_KEY', '')
+
+def _kalshi_auth_headers(method: str, path: str) -> Dict[str, str]:
+    """生成Kalshi认证headers（RSA-PSS签名）"""
+    if not KALSHI_API_KEY or not KALSHI_PRIVATE_KEY:
+        return {}
+    try:
+        import time as _time
+        import base64
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        timestamp = str(int(_time.time() * 1000))
+        msg = f"{timestamp}{method}{path}"
+        # 私钥可能是PEM格式字符串
+        if '-----BEGIN' in KALSHI_PRIVATE_KEY:
+            private_key = serialization.load_pem_private_key(
+                KALSHI_PRIVATE_KEY.encode(), password=None
+            )
+        else:
+            # 假设是base64编码的DER
+            private_key = serialization.load_der_private_key(
+                base64.b64decode(KALSHI_PRIVATE_KEY), password=None
+            )
+        signature = private_key.sign(
+            msg.encode(),
+            padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.MAX_LENGTH),
+            hashes.SHA256()
+        )
+        sig_b64 = base64.b64encode(signature).decode()
+        return {
+            'KALSHI-ACCESS-KEY': KALSHI_API_KEY,
+            'KALSHI-ACCESS-TIMESTAMP': timestamp,
+            'KALSHI-ACCESS-SIGNATURE': sig_b64,
+        }
+    except Exception as e:
+        logger.warning(f"Kalshi签名失败: {e}")
+        return {}
 
 def fetch_fed_probability() -> Dict[str, Any]:
-    result = {'cut_prob': None, 'hike_prob': None, 'market_question': None, 'error': None}
-
-    def parse_outcomes(best_market):
-        result['market_question'] = best_market.get('question') or best_market.get('title')
-        outcomes = best_market.get('outcomes', '[]')
-        prices = best_market.get('outcomePrices', '[]')
-        if isinstance(outcomes, str):
-            try:
-                outcomes = json.loads(outcomes)
-            except:
-                outcomes = []
-        if isinstance(prices, str):
-            try:
-                prices = json.loads(prices)
-            except:
-                prices = []
-        for o, p in zip(outcomes, prices):
-            try:
-                prob = float(p) * 100
-            except:
-                continue
-            o_lower = str(o).lower()
-            if any(kw in o_lower for kw in ['cut', '降', '降息', 'lower', 'decrease', 'reduce']):
-                result['cut_prob'] = prob
-            elif any(kw in o_lower for kw in ['hike', '加', '加息', 'raise', 'higher', 'increase']):
-                result['hike_prob'] = prob
-
+    result = {'cut_prob': None, 'hike_prob': None, 'hold_prob': None,
+              'market_question': None, 'error': None, 'source': 'Kalshi'}
     try:
-        # 搜索markets
-        r = requests.get('https://gamma-api.polymarket.com/markets',
-                         params={'search': 'fed rate', 'closed': 'false', 'limit': 30,
-                                 'order': 'volume24hr', 'ascending': 'false'},
-                         headers=HEADERS, timeout=TIMEOUT)
-        markets = []
-        if r.status_code == 200:
-            markets = r.json()
-            if not isinstance(markets, list):
-                markets = []
+        # Kalshi: 搜索KXFED系列的开放市场
+        base_url = 'https://api.elections.kalshi.com/trade-api/v2'
+        path = '/markets'
+        headers = {**HEADERS, 'Accept': 'application/json', **_kalshi_auth_headers('GET', path)}
+        r = requests.get(f'{base_url}{path}',
+                         params={'series_ticker': 'KXFED', 'status': 'open', 'limit': 20},
+                         headers=headers, timeout=TIMEOUT)
+        if r.status_code != 200:
+            result['error'] = f"HTTP {r.status_code}"
+            logger.warning(f"Kalshi搜索状态码: {r.status_code}, body: {r.text[:200]}")
+            return result
 
-        # 搜索events（events包含多个markets）
-        try:
-            r2 = requests.get('https://gamma-api.polymarket.com/events',
-                              params={'search': 'fed rate', 'closed': 'false', 'limit': 10,
-                                      'order': 'volume24hr', 'ascending': 'false'},
-                              headers=HEADERS, timeout=TIMEOUT)
-            if r2.status_code == 200:
-                events = r2.json()
-                if isinstance(events, list):
-                    for ev in events:
-                        ev_markets = ev.get('markets', [])
-                        if isinstance(ev_markets, list):
-                            markets.extend(ev_markets)
-        except:
-            pass
-
+        markets = r.json().get('markets', [])
         if not markets:
-            result['error'] = "无搜索结果"
-            logger.warning("Polymarket无搜索结果")
+            result['error'] = "无KXFED开放市场"
+            logger.warning("Kalshi无KXFED开放市场")
             return result
 
-        # 找最相关的市场
-        best_market = None
-        keywords = ['fed', 'fomc', 'rate', 'interest', 'cut', 'hike', 'powell', '降息', '加息']
-        for m in markets:
-            q = str(m.get('question', '') + ' ' + m.get('title', '')).lower()
-            if any(kw in q for kw in keywords):
-                # 优先选有outcomes的
-                if m.get('outcomes'):
-                    best_market = m
-                    break
+        # 找最近到期的市场（按expiration_time排序）
+        markets.sort(key=lambda m: m.get('expiration_time', ''))
+        target_market = markets[0]
+        result['market_question'] = target_market.get('title') or target_market.get('ticker')
 
-        if not best_market:
-            # 降级：选第一个有outcomes的
-            for m in markets:
-                if m.get('outcomes'):
-                    best_market = m
-                    break
+        # 获取市场详情（获取更准确的价格）
+        ticker = target_market.get('ticker')
+        if ticker:
+            path2 = f'/markets/{ticker}'
+            headers2 = {**HEADERS, 'Accept': 'application/json', **_kalshi_auth_headers('GET', path2)}
+            r2 = requests.get(f'{base_url}{path2}', headers=headers2, timeout=TIMEOUT)
+            if r2.status_code == 200:
+                market_detail = r2.json().get('market', target_market)
+            else:
+                market_detail = target_market
+        else:
+            market_detail = target_market
 
-        if not best_market:
-            result['error'] = "未找到有效市场"
-            logger.warning("Polymarket未找到有效市场")
-            return result
+        # Kalshi价格以美分计，yes_bid/yes_ask的中间价就是概率
+        yes_bid = safe_float(market_detail.get('yes_bid'))
+        yes_ask = safe_float(market_detail.get('yes_ask'))
+        last_price = safe_float(market_detail.get('last_price'))
 
-        parse_outcomes(best_market)
-        logger.info(f"Polymarket: {str(result['market_question'])[:60]}... 降息={result['cut_prob']}%, 加息={result['hike_prob']}%")
+        prob = None
+        if yes_bid is not None and yes_ask is not None:
+            prob = (yes_bid + yes_ask) / 2 / 100 * 100  # 美分转百分比
+        elif last_price is not None:
+            prob = last_price / 100 * 100
+
+        title_lower = str(result['market_question']).lower()
+        if prob is not None:
+            # 根据标题判断是加息/降息/维持
+            if any(kw in title_lower for kw in ['cut', '降', '降息', 'lower', 'decrease', 'reduce']):
+                result['cut_prob'] = prob
+            elif any(kw in title_lower for kw in ['hike', '加', '加息', 'raise', 'higher', 'increase']):
+                result['hike_prob'] = prob
+            elif any(kw in title_lower for kw in ['hold', '维持', '不变', 'unchanged', 'pause']):
+                result['hold_prob'] = prob
+            else:
+                # 如果标题不明确，把概率作为hold（最常见）
+                result['hold_prob'] = prob
+
+        # 如果只找到了一个市场，尝试搜索同一系列的其他市场获取加息/降息
+        if result['cut_prob'] is None or result['hike_prob'] is None:
+            for m in markets[1:5]:  # 看前5个市场
+                m_title = str(m.get('title', '')).lower()
+                m_ticker = str(m.get('ticker', ''))
+                m_yes_bid = safe_float(m.get('yes_bid'))
+                m_yes_ask = safe_float(m.get('yes_ask'))
+                m_prob = None
+                if m_yes_bid is not None and m_yes_ask is not None:
+                    m_prob = (m_yes_bid + m_yes_ask) / 2
+                if m_prob is None:
+                    continue
+                if result['cut_prob'] is None and any(kw in m_title for kw in ['cut', '降', '降息', 'lower']):
+                    result['cut_prob'] = m_prob
+                elif result['hike_prob'] is None and any(kw in m_title for kw in ['hike', '加', '加息', 'raise', 'higher']):
+                    result['hike_prob'] = m_prob
+
+        logger.info(f"Kalshi: {str(result['market_question'])[:60]}... 降息={result['cut_prob']}%, 加息={result['hike_prob']}%, 维持={result['hold_prob']}%")
     except Exception as e:
         result['error'] = str(e)
-        logger.warning(f"Polymarket失败: {e}")
+        logger.warning(f"Kalshi失败: {e}")
     return result
 
 
@@ -666,23 +703,29 @@ def fetch_derivatives() -> Dict[str, Any]:
         except Exception as e:
             logger.warning(f"Bybit多空比失败: {e}")
 
-    # Coinglass公开API备选
-    if result['long_short_ratio'] is None:
+    # Coinglass正式API（带key，美国IP可访问）
+    if result['long_short_ratio'] is None and COINGLASS_API_KEY:
         try:
-            r = requests.get('https://open-api.coinglass.com/public/v2/long_short_ratio',
-                             params={'symbol': 'BTC'},
-                             headers={**HEADERS, 'Accept': 'application/json'}, timeout=TIMEOUT)
+            r = requests.get('https://open-api-v4.coinglass.com/api/futures/global-long-short-account-ratio/history',
+                             params={'symbol': 'BTC', 'interval': '1h', 'limit': 1},
+                             headers={'coinglass-api-key': COINGLASS_API_KEY, 'Accept': 'application/json'},
+                             timeout=TIMEOUT)
             if r.status_code == 200:
                 data = r.json()
-                if isinstance(data, dict):
-                    ls_list = data.get('data', {}).get('longShortRatioList', [])
-                    if ls_list:
-                        latest = ls_list[-1]
-                        result['long_short_ratio'] = float(latest.get('longShortRatio', 0))
+                # Coinglass返回格式: {"data": [{"time":..., "global_account_long_percent":73.24, "global_account_short_percent":26.76}]}
+                ls_list = data.get('data', []) if isinstance(data, dict) else data
+                if ls_list and isinstance(ls_list, list):
+                    latest = ls_list[-1]
+                    long_pct = float(latest.get('global_account_long_percent', 0))
+                    short_pct = float(latest.get('global_account_short_percent', 0))
+                    if short_pct > 0:
+                        result['long_short_ratio'] = long_pct / short_pct
+                        result['long_account'] = long_pct / 100
+                        result['short_account'] = short_pct / 100
                         result['ls_source'] = 'Coinglass'
-                        logger.info(f"多空比(Coinglass): {result['long_short_ratio']:.2f}")
+                        logger.info(f"多空比(Coinglass): {result['long_short_ratio']:.2f} (多{long_pct:.1f}%/空{short_pct:.1f}%)")
         except Exception as e:
-            logger.warning(f"Coinglass多空比失败: {e}")
+            logger.warning(f"Coinglass正式API多空比失败: {e}")
 
     # OKX备选
     if result['long_short_ratio'] is None:
